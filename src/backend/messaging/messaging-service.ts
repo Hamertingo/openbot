@@ -104,6 +104,8 @@ interface LiveConnection {
   transport: MessagingTransport | null;
   identity: ConnectionIdentity | null;
   state: MessagingConnectionState;
+  /** The last state the transport reported. A rate limit ends in it. */
+  reported: MessagingConnectionState;
   retryAt: string | null;
 }
 
@@ -132,6 +134,8 @@ const LIVE_STATES = new Set<MessagingConnectionState>(["connecting", "connected"
 const APPROVAL_TEXT_LIMIT = 2_500;
 const CANCEL_TEXT = /^(cancel|stop)$/i;
 const RECENT_MESSAGES = 2_000;
+/** How long a Telegram link waits for the Signal socket. */
+const TELEGRAM_READY_TIMEOUT_MS = 15_000;
 /** How long a connection waits before it tries Slack again after Slack was unreachable. */
 const IDENTIFY_RETRY_MS = 30_000;
 /** The marker `mention` uses. Text that did not come from the host has it taken out. */
@@ -465,9 +469,31 @@ export class MessagingService {
     const timer = setTimeout(() => this.#endTelegramLinkLease(), TELEGRAM_LINK_CODE_TTL_SECONDS * 1_000);
     timer.unref?.();
     this.#telegramLinkLease = { release, timer };
-    const link = yield* app.createLink().pipe(Effect.onError(() => Effect.sync(() => this.#endTelegramLinkLease())));
+    // Opened before the socket is ready, Telegram could send the code while Signal has no socket to
+    // route the new chat to.
+    const link = yield* Effect.all([this.#telegramReady(ingress), app.createLink()], { concurrency: "unbounded" }).pipe(
+      Effect.map(([, created]) => created),
+      Effect.onError(() => Effect.sync(() => this.#endTelegramLinkLease())),
+    );
     yield* messagingIo(() => app.openExternal(telegramLinkUrl(link.botUsername, link.code, place)));
   }).bind(this);
+
+  /** Waits a short time for the socket to be open with a Signal that has Telegram. */
+  #telegramReady(ingress: MessagingIngress): Effect.Effect<void, MessagingOperationFailed> {
+    const unavailable = () =>
+      new MessagingOperationFailed({ cause: new Error(sourceText("error.messaging.telegramRelayUnavailable")) });
+    if (ingress.telegram.available()) return Effect.void;
+    // A Signal that answered without Telegram does not gain it on this socket.
+    if (ingress.state() === "online") return Effect.fail(unavailable());
+    return Effect.callback<void>((resume) => {
+      const stop = ingress.onState(() => {
+        if (!ingress.telegram.available()) return;
+        stop();
+        resume(Effect.void);
+      });
+      return Effect.sync(stop);
+    }).pipe(Effect.timeoutOrElse({ duration: TELEGRAM_READY_TIMEOUT_MS, orElse: () => Effect.fail(unavailable()) }));
+  }
 
   #endTelegramLinkLease(): void {
     const lease = this.#telegramLinkLease;
@@ -603,11 +629,22 @@ export class MessagingService {
         rateLimited: (retryAt) => {
           live.retryAt = retryAt;
           this.#dispatch(this.#setState(live, "rate_limited"));
+          // The platform said when it can take calls again. A newer limit replaces this one.
+          const end = setTimeout(
+            () => {
+              if (this.#live.get(record.connectionId) !== live || live.retryAt !== retryAt) return;
+              live.retryAt = null;
+              if (live.state === "rate_limited") this.#dispatch(this.#setState(live, live.reported));
+            },
+            Math.max(0, Date.parse(retryAt) - Date.now()),
+          );
+          end.unref?.();
         },
       }),
       transport: null,
       identity: null,
       state: "connecting",
+      reported: "connecting",
       retryAt: null,
     };
     this.#live.set(record.connectionId, live);
@@ -643,6 +680,7 @@ export class MessagingService {
     live.transport = transport;
     transport.start({
       state: (state) => {
+        live.reported = state;
         if (state === "connected") live.retryAt = null;
         this.#dispatch(this.#setState(live, state));
       },

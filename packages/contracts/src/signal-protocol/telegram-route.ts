@@ -42,6 +42,13 @@ export const TELEGRAM_UPDATE_BYTES_LIMIT = 64 * 1024;
 /** The Bot API's own limit for a file a bot downloads. Signal applies it to uploads too. */
 export const TELEGRAM_FILE_BYTES_LIMIT = 20 * 1024 * 1024;
 
+/**
+ * The longest `text` of a call. Telegram allows 4,096 characters after it parses the HTML, but the
+ * escapes and tags make the HTML longer. The host keeps a call's text under this many UTF-8 bytes,
+ * and Signal refuses a text over this many characters: a refused frame closes the whole socket.
+ */
+export const TELEGRAM_TEXT_LIMIT = 32_000;
+
 /** How long a file or upload token stays valid. */
 export const TELEGRAM_FILE_TOKEN_TTL_SECONDS = 2 * 60;
 

@@ -9,6 +9,7 @@ import type { AgentModelId, AgentReasoningEffort } from "./ipc-agent-identity";
 import type { AgentProviderId } from "./ipc-agent-status";
 import { isBoundedString, isIdentifier, isNullableBoundedString } from "./ipc-bounded-values";
 import { isBoolean, isDynamicRecord, isOneOf } from "./runtime-values";
+import { TELEGRAM_ROUTE_CHATS_LIMIT } from "./signal-protocol/telegram-route";
 
 export const MESSAGING_PLATFORMS = ["slack", "telegram"] as const;
 export type MessagingPlatform = (typeof MESSAGING_PLATFORMS)[number];
@@ -147,11 +148,12 @@ export function isAddSlackOrchestratorResult(value: unknown): value is AddSlackO
   );
 }
 
+/** One connection per chat, so a host has as many as the account service links to it. */
 export function isTelegramOverview(value: unknown): value is TelegramOverview {
   return (
     isDynamicRecord(value) &&
     Array.isArray(value.connections) &&
-    value.connections.length <= MESSAGING_LIMITS.connections &&
+    value.connections.length <= TELEGRAM_ROUTE_CHATS_LIMIT &&
     value.connections.every(isMessagingConnection)
   );
 }

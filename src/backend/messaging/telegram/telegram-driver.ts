@@ -1,8 +1,10 @@
 import { stat } from "node:fs/promises";
 import {
   TELEGRAM_FILE_BYTES_LIMIT,
+  TELEGRAM_TEXT_LIMIT,
   type TelegramCallMethod,
   type TelegramCallParams,
+  type TelegramCallResult,
   type TelegramInlineKeyboard,
 } from "@openbot/contracts/signal-protocol/telegram-route";
 import { sourceText } from "@openbot/i18n/source";
@@ -29,6 +31,12 @@ import { TelegramTransport } from "./telegram-transport";
 import { TELEGRAM_CALLBACK_PREFIXES, telegramPlacement, telegramThreadKey } from "./telegram-updates";
 
 /** Emoji that the Bot API accepts as a reaction. A bot sets one reaction on a message. */
+/** As the Slack client: a rate-limited call waits and tries again, up to this many times. */
+const RATE_LIMIT_RETRIES = 3;
+const RATE_LIMIT_WAIT_LIMIT_S = 60;
+/** A shorter wait does not change the connection's state. */
+const RATE_LIMIT_NOTICE_S = 5;
+
 const REACTIONS: Record<StatusReaction, string> = {
   received: "👀",
   done: "👌",
@@ -247,10 +255,12 @@ class TelegramAdapter implements MessagingAdapter {
     markdown: string,
     send: (text: { text: string; html: boolean }) => Effect.Effect<void, MessagingAdapterError>,
   ): Effect.Effect<void, MessagingAdapterError> {
-    return send({ text: telegramHtml(markdown), html: true }).pipe(
-      Effect.catch((failure) =>
-        unparsable(failure) ? send({ text: telegramPlainText(markdown), html: false }) : Effect.fail(failure),
-      ),
+    const html = telegramHtml(markdown);
+    const plain = () => send({ text: telegramPlainText(markdown), html: false });
+    // Escapes make HTML longer than its text. Signal refuses a longer call and closes the socket.
+    if (new TextEncoder().encode(html).byteLength > TELEGRAM_TEXT_LIMIT) return plain();
+    return send({ text: html, html: true }).pipe(
+      Effect.catch((failure) => (unparsable(failure) ? plain() : Effect.fail(failure))),
     );
   }
 
@@ -294,15 +304,20 @@ class TelegramAdapter implements MessagingAdapter {
     return Number(target.platformChannelId);
   }
 
-  #call<M extends TelegramCallMethod>(method: M, params: TelegramCallParams[M]) {
+  #call<M extends TelegramCallMethod>(
+    method: M,
+    params: TelegramCallParams[M],
+    attempt = 0,
+  ): Effect.Effect<TelegramCallResult, MessagingAdapterError> {
     return this.#gateway.call(this.#botId, method, params).pipe(
-      Effect.tapError((failure) =>
-        Effect.sync(() => {
-          const error = failure.cause;
-          if (error instanceof TelegramCallError && error.errorCode === 429)
-            this.#rateLimited(new Date(Date.now() + (error.retryAfter ?? 5) * 1_000).toISOString());
-        }),
-      ),
+      Effect.catch((failure) => {
+        const error = failure.cause;
+        if (!(error instanceof TelegramCallError) || error.errorCode !== 429 || attempt >= RATE_LIMIT_RETRIES)
+          return Effect.fail(failure);
+        const waitS = Math.min(Math.max(error.retryAfter ?? 1, 1), RATE_LIMIT_WAIT_LIMIT_S);
+        if (waitS > RATE_LIMIT_NOTICE_S) this.#rateLimited(new Date(Date.now() + waitS * 1_000).toISOString());
+        return Effect.sleep(waitS * 1_000).pipe(Effect.andThen(this.#call(method, params, attempt + 1)));
+      }),
     );
   }
 }

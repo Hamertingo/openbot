@@ -14,6 +14,7 @@ import {
 } from "@openbot/contracts/signal-protocol/messages";
 import {
   TELEGRAM_BOT_ID_PATTERN,
+  TELEGRAM_TEXT_LIMIT,
   type TelegramCallMethod,
   type TelegramCallParams,
 } from "@openbot/contracts/signal-protocol/telegram-route";
@@ -61,7 +62,7 @@ const signalMessageTypeSchema = z.enum([
 // frame.
 const telegramChatIdSchema = z.int();
 const telegramMessageIdSchema = z.int().positive();
-const telegramTextSchema = z.string().min(1).max(12_000);
+const telegramTextSchema = z.string().min(1).max(TELEGRAM_TEXT_LIMIT);
 const telegramKeyboardSchema = z.strictObject({
   inline_keyboard: z
     .array(
