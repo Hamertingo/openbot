@@ -92,9 +92,9 @@ jobs:
           cat "$GITHUB_OUTPUT"
 
   check:
-    # `check:desktop` is this job and `browser` together, in that order. The
-    # browser smoke test starts the real Electron binary under xvfb on another
-    # Ubuntu runner, so the two run side by side. The install here is the full
+    # `check:desktop` is this job, `lint` and `browser` together. The browser
+    # smoke test starts the real Electron binary under xvfb on another Ubuntu
+    # runner, so the three run side by side. The install here is the full
     # one: this job builds with electron-vite, which resolves the `electron`
     # package.
     name: Check
@@ -109,23 +109,44 @@ jobs:
       - name: Set up Bun
         uses: ./.github/actions/setup-bun
 
-      - name: Check unused files and dependencies
-        run: bun run knip:check
-
       - name: Check image asset directories
         run: bun run check:assets
 
       - name: Check desktop application
-        run: bun run check:desktop:static
-
-      - name: Check ratcheted lint rules
-        run: bun run lint:ratchet
+        run: bun run check:desktop:build
 
       - name: Check translation catalogs
         run: bun run i18n:check
 
       - name: Check ratcheted TypeScript options
         run: bun run types:ratchet
+
+  lint:
+    # knip, Biome and the lint ratchet read only source files. They need no Electron binary, no
+    # native build and no build output, so they run beside Check and skip install scripts.
+    # `check:desktop:static` is `lint` and Check's `check:desktop:build` together.
+    name: Lint
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install: ignore-scripts
+
+      - name: Check unused files and dependencies
+        run: bun run knip:check
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Check ratcheted lint rules
+        run: bun run lint:ratchet
 
   browser:
     # The smoke test starts the real Electron binary and opens windows, so it
@@ -342,7 +363,7 @@ jobs:
     # failed or cancelled job, including `detect` itself, fails this one.
     name: All required checks pass
     if: always()
-    needs: [detect, check, browser, tests-desktop, tests-sites, tests-remote, surfaces, api, storybook]
+    needs: [detect, check, lint, browser, tests-desktop, tests-sites, tests-remote, surfaces, api, storybook]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -368,7 +389,7 @@ jobs:
     # `apps/auth-api`, which `api` already covers: mobile, the site router, the
     # team client and the remote stack all consume the account API, so a red
     # Surfaces is the signal that this deploy is the thing about to break them.
-    needs: [check, browser, tests-desktop, tests-sites, tests-remote, api, storybook, surfaces]
+    needs: [check, lint, browser, tests-desktop, tests-sites, tests-remote, api, storybook, surfaces]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: cloudflare-production

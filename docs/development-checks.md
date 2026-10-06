@@ -63,8 +63,8 @@ as data, so it can write the comment without running pull request code.
 
 The pre-commit hook in `.githooks/pre-commit` runs `check:staged`, then `check:ui` and
 `bun run typecheck`. The last two run only when the commit stages code, style, JSON, GritQL or
-`bun.lock` files, so a commit of only text is fast. In CI, `check:desktop:static` (the UI check,
-lint, desktop typecheck, build and preload check) takes about a minute, and each other typecheck takes a few
+`bun.lock` files, so a commit of only text is fast. In CI, `check:desktop:build` (the UI check,
+desktop typecheck, build and preload check) takes about a minute, and each other typecheck takes a few
 seconds. When `openbot-database-schema.ts`, `channel-schema.ts`, `mcp-schema.ts`, the parity test or
 `openbot-database-schema-history.json` is staged, the hook also runs `src/backend/openbot-database-schema-parity.test.ts`.
 
@@ -82,7 +82,8 @@ Its main jobs are:
 
 | Job | Runner | Commands |
 | --- | --- | --- |
-| Check | `ubuntu-latest` | `bun run knip:check`, `bun run check:assets`, `bun run check:desktop:static`, `bun run lint:ratchet`, `bun run types:ratchet` |
+| Check | `ubuntu-latest` | `bun run check:assets`, `bun run check:desktop:build`, `bun run i18n:check`, `bun run types:ratchet` |
+| Lint | `ubuntu-latest` | `bun run knip:check`, `bun run lint`, `bun run lint:ratchet` |
 | Browser smoke | `ubuntu-latest` | `xvfb-run -a bun run test:browser` |
 | Tests (desktop 1/2, 2/2) | `ubuntu-latest` | `bun run test:desktop -- --shard=<n>/2` |
 | Tests (sites) | `ubuntu-latest` | `bun run test:sites` |
@@ -112,7 +113,7 @@ renderer bundles it. Then it selects the lanes:
 
 | Lane | Jobs | Runs when a changed path is |
 | --- | --- | --- |
-| `code` | Check, Tests (desktop) | anything that is left |
+| `code` | Check, Lint, Tests (desktop) | anything that is left |
 | `desktop` | Browser smoke | outside `apps/auth-api`, `apps/mobile`, `apps/site-router`, `remote` and `docker` |
 | `api` | API | in `apps/auth-api`, `apps/site-router`, `src/renderer` or `resources`, or a `CHANGELOG.md` |
 | `sites` | Tests (sites) | in `apps/site-router` |
@@ -140,12 +141,13 @@ Electron and checks that `window.openbot` has exactly one function for each endp
 `import()` and a `require` of a module that a sandboxed preload cannot load. It takes less than one
 second.
 
-`bun run check:desktop` still runs everything: it is `check:desktop:static`, which holds the UI
-check, the lint, the desktop typecheck, the build and `verify:preload`, followed by the browser
-smoke test. CI is
-the only caller that splits them. The smoke test starts the real Electron binary, so it runs under
-xvfb on Ubuntu rather than on a macOS runner, and reads nothing the build writes, so the order
-between the halves is free. `release.yml` keeps the whole of `check:desktop` on one macOS runner,
+`bun run check:desktop` still runs everything: it is `check:desktop:static`, followed by the browser
+smoke test. `check:desktop:static` is the lint, then `check:desktop:build`: the UI check, the desktop
+typecheck, the build and `verify:preload`. CI is the only caller that splits them, into the Lint,
+Check and Browser smoke jobs. Lint reads only source files, so it installs with `--ignore-scripts`
+and does not wait for the full install and the build. The smoke test starts the real Electron
+binary, so it runs under xvfb on Ubuntu rather than on a macOS runner, and reads nothing the build
+writes, so the order between the parts is free. `release.yml` keeps the whole of `check:desktop` on one macOS runner,
 where it checks the machine that builds the release.
 
 `bun run knip:check` fails on unused files, unused exports and exported types, unused or unlisted
