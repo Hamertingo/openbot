@@ -104,13 +104,30 @@ All of these jobs except the preview build gate Cloudflare production deployment
 that dependency list, which allowed deployment despite a failed mobile or remote check.
 These long suites belong in CI; local desktop runs can reach their time limits under load.
 
-The `Detect changed areas` job lets a pull request skip four lanes it cannot affect: Tests (sites),
-Tests (remote), Surfaces and Storybook build. It compares the merge commit with its first parent, and
-runs a lane when a path the lane reads changed. A path every workspace reads (`package.json`,
-`bun.lock`, `tsconfig*.json`, `biome.json`, `.github/`, `packages/`, `tools/`, `patches/`, `vendor/`)
-runs all four. A push to `main` and a manual run always run every lane, because a skipped need would
-skip `deploy-production`. When a new lane reads another directory, add it to that lane's pattern in
-the `detect` job.
+The `Detect changed areas` job lets a pull request skip the lanes it cannot affect. It compares the
+merge commit with its first parent and first removes Markdown that no build or test reads: `docs/`,
+`plans/` and `changelog.d/` Markdown, every `AGENTS.md`, and the root Markdown files except
+`CHANGELOG.md`, which the API bundles. Markdown under `resources/` is not removed either, because the
+renderer bundles it. Then it selects the lanes:
+
+| Lane | Jobs | Runs when a changed path is |
+| --- | --- | --- |
+| `code` | Check, Tests (desktop) | anything that is left |
+| `desktop` | Browser smoke | outside `apps/auth-api`, `apps/mobile`, `apps/site-router`, `remote` and `docker` |
+| `api` | API, Cloudflare preview build | in `apps/auth-api`, `apps/site-router`, `src/renderer` or `resources`, or a `CHANGELOG.md` |
+| `sites` | Tests (sites) | in `apps/site-router` |
+| `remote` | Tests (remote) | in `remote` or `scripts` |
+| `storybook` | Storybook build | in `src`, `apps/auth-api`, `.storybook`, `resources`, `marketplace` or `build` |
+| `surfaces` | Surfaces | in `apps/mobile`, `apps/site-router`, `remote` or `scripts` |
+
+A path every workspace reads (`package.json`, `bun.lock`, `tsconfig*.json`, `biome.json`,
+`.github/`, `packages/`, `tools/`, `patches/`, `vendor/`) runs every lane. `code` runs for a
+mobile-only pull request: the desktop test run holds the mobile unit tests, desktop tests read
+mobile, API and remote files, and lint and knip cover every workspace. The API Worker bundles the
+renderer preview and web client and imports `apps/site-router/src`, so `api` reads them. A push to
+`main` and a manual run always run every lane, because a skipped need would skip
+`deploy-production`. When a lane reads another directory, add it to that lane's pattern in the
+`detect` job. When in doubt, let the lane run.
 
 `All required checks pass` needs every other check job and fails when one of them failed or was
 cancelled; a skipped lane counts as a pass. Branch protection requires only this job, so a new lane
