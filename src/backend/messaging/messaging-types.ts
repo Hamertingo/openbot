@@ -186,11 +186,12 @@ export type IngressHandler = (
   delivery: IngressDelivery,
 ) => Effect.Effect<IngressAnswer, MessagingOperationFailed>;
 
-/** Handles one Telegram update of a chat routed to this host. */
+/** Handles one Telegram update of a chat routed to this host. `linked` marks the update of a new link. */
 export type TelegramIngressHandler = (
   botId: string,
   chatId: string,
   body: Uint8Array,
+  linked: boolean,
 ) => Effect.Effect<void, MessagingOperationFailed>;
 
 /**

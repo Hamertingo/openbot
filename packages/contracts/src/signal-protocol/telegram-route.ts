@@ -76,6 +76,14 @@ export interface TelegramRouteChat {
   linkedAt: number;
 }
 
+/**
+ * One link of a chat: the bot, the chat and the time of the link. Validation compares all three: the
+ * production and development bots can share a chat, and one of their routes can be revoked alone.
+ */
+export function telegramRouteChatKey(chat: TelegramRouteChat): string {
+  return `${chat.botId}:${chat.id}:${chat.linkedAt}`;
+}
+
 export interface TelegramInlineButton {
   text: string;
   /** 1 to 64 bytes. */

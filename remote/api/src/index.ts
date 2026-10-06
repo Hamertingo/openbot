@@ -20,7 +20,9 @@ class ControlPlaneError extends Schema.TaggedError<ControlPlaneError>()("Control
 
 const ResumeValidation = Schema.Struct({ valid: Schema.Boolean });
 const SlackValidation = Schema.Struct({ teams: Schema.Array(Schema.String) });
-const TelegramValidation = Schema.Struct({ chats: Schema.Array(Schema.String) });
+const TelegramValidation = Schema.Struct({
+  chats: Schema.Array(Schema.Struct({ id: Schema.String, botId: Schema.String, linkedAt: Schema.Int })),
+});
 const TelegramLink = Schema.Struct({ hostId: Schema.String, linkedAt: Schema.Int });
 
 class ControlPlane extends Context.Service<
@@ -34,7 +36,10 @@ class ControlPlane extends Context.Service<
     validateTelegramRoute(
       hostId: string,
       chats: import("@openbot/contracts/signal-protocol/telegram-route").TelegramRouteChat[],
-    ): Effect.Effect<string[], ControlPlaneError>;
+    ): Effect.Effect<
+      import("@openbot/contracts/signal-protocol/telegram-route").TelegramRouteChat[],
+      ControlPlaneError
+    >;
     // `null` when the code is not valid (404) or the chat is linked to another host (409).
     linkTelegramChat(
       botId: string,

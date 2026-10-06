@@ -4,6 +4,7 @@ import {
   TELEGRAM_ROUTE_TTL_SECONDS,
   type TelegramCallResult,
   type TelegramRouteChat,
+  telegramRouteChatKey,
 } from "@openbot/contracts/signal-protocol/telegram-route";
 import { Context, Effect, Fiber, Layer, Result } from "effect";
 import {
@@ -44,7 +45,10 @@ export interface RemoteTokenProvider {
   validateSlackRoute?(hostId: string, teams: SlackRouteTeam[]): Effect.Effect<string[], RemoteTokenError>;
   /** Without a Telegram route verifier, an ingress socket receives no chat. */
   verifyTelegramRoute?(token: string, hostId: string): Effect.Effect<TelegramRoute, RemoteTokenError>;
-  validateTelegramRoute?(hostId: string, chats: TelegramRouteChat[]): Effect.Effect<string[], RemoteTokenError>;
+  validateTelegramRoute?(
+    hostId: string,
+    chats: TelegramRouteChat[],
+  ): Effect.Effect<TelegramRouteChat[], RemoteTokenError>;
   /** `null` when the code is not valid or the chat belongs to another host. */
   linkTelegramChat?(
     botId: string,
@@ -540,9 +544,16 @@ export class SignalService {
 
   /**
    * Passes one Telegram update to the `ingress` socket of the chat's host. Telegram does not wait for
-   * the host, so nothing comes back. Returns `false` when no socket holds the chat.
+   * the host, so nothing comes back. Returns `false` when no socket holds the chat. `linked` marks the
+   * `/start` update that the account service just linked, the only one a host links a chat on.
    */
-  deliverTelegram(botId: string, chatId: string, body: Uint8Array, callbackQueryId: string | null): boolean {
+  deliverTelegram(
+    botId: string,
+    chatId: string,
+    body: Uint8Array,
+    callbackQueryId: string | null,
+    linked = false,
+  ): boolean {
     const socketId = this.#telegramChats.get(telegramRouteKey(botId, chatId));
     const ingress = socketId ? this.#peers.get(socketId) : undefined;
     if (!ingress) {
@@ -557,6 +568,7 @@ export class SignalService {
       botId,
       chatId,
       bodyBase64: Buffer.from(body).toString("base64"),
+      ...(linked ? { linked: true as const } : {}),
     });
     return true;
   }
@@ -727,8 +739,12 @@ export class SignalService {
               if (Date.now() < this.#validateTelegramRoutesUntil && telegramRoute.chats.length > 0) {
                 if (!tokens.validateTelegramRoute)
                   return yield* new RemoteTokenError({ message: "Telegram route validation required." });
-                const linked = new Set(yield* tokens.validateTelegramRoute(claims.hostId, telegramRoute.chats));
-                telegramRoute = { chats: telegramRoute.chats.filter((chat) => linked.has(chat.id)) };
+                const linked = new Set(
+                  (yield* tokens.validateTelegramRoute(claims.hostId, telegramRoute.chats)).map(telegramRouteChatKey),
+                );
+                telegramRoute = {
+                  chats: telegramRoute.chats.filter((chat) => linked.has(telegramRouteChatKey(chat))),
+                };
               }
             }
           }

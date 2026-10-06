@@ -37,7 +37,7 @@ const REACTIONS: Record<StatusReaction, string> = {
 };
 
 /** The credentials of one Telegram connection. None is secret: the bot token is in Signal. */
-export interface TelegramCredentials {
+interface TelegramCredentials {
   botId: string;
   chatId: string;
   botUsername?: string;
@@ -350,7 +350,7 @@ export function telegramDriver(options: TelegramDriverOptions = {}): MessagingDr
   };
 }
 
-export function telegramCredentials(values: Record<string, string>): TelegramCredentials {
+function telegramCredentials(values: Record<string, string>): TelegramCredentials {
   return {
     botId: values.botId ?? "",
     chatId: values.chatId ?? "",

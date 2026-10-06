@@ -1664,7 +1664,9 @@ must not reach any host. Only Signal has it (`TELEGRAM_BOT_TOKENS`), and the con
   Telegram sends `/start <code>` in the chat that adds the bot. Signal asks the Worker
   (`/v2/remote/telegram-route/link`, signed) to link the chat to the host of the code
   (`telegram_chat_routes`, `telegram_link_codes`: hashes only, no chat name), routes the chat to that
-  host's socket at once, and passes the update on; the host then makes the connection. Another
+  host's socket at once, and passes the update on with `linked: true`; the host makes the
+  connection only on that flag, because anyone in a routed chat can send a `/start` with any code.
+  The open code holds the host's socket until the link or its expiry, as no connection may hold it. Another
   account's host gets `telegram_chat_taken`.
 - **Updates.** Telegram posts to `https://signal.openbot.run/v1/telegram/updates/<bot ID>` with a
   secret header that Signal derives for each bot. Signal reads only the chat ID, a link code and a

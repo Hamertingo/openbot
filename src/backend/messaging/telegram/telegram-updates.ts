@@ -10,7 +10,7 @@ import type { TelegramChatState } from "./telegram-chats";
 export const TELEGRAM_CALLBACK_PREFIXES = { accept: "a:", decline: "d:", stop: "s:" } as const;
 
 /** The thread key of a private chat: one conversation for the whole chat. */
-export const TELEGRAM_DIRECT_THREAD = "dm";
+const TELEGRAM_DIRECT_THREAD = "dm";
 
 const START_COMMAND = /^\/start(?:@[A-Za-z0-9_]{1,64})?(?:\s+(\S+))?\s*$/u;
 

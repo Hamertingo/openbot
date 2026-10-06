@@ -206,6 +206,9 @@ export type SignalServerMessage =
       botId: string;
       chatId: string;
       bodyBase64: string;
+      // Only on the `/start <code>` update that the account service just linked to this host. A host
+      // links a chat only on this flag: anyone in a routed chat can send a `/start` with any code.
+      linked?: true;
     }
   // The answer to one `telegram-call`.
   | ({

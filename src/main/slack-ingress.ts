@@ -248,9 +248,12 @@ export class SlackIngress implements MessagingIngress {
     if (message.type === "telegram-delivery") {
       const telegramHandler = this.#telegramHandler;
       if (telegramHandler)
-        yield* telegramHandler(message.botId, message.chatId, Buffer.from(message.bodyBase64, "base64")).pipe(
-          Effect.catch(() => Effect.void),
-        );
+        yield* telegramHandler(
+          message.botId,
+          message.chatId,
+          Buffer.from(message.bodyBase64, "base64"),
+          message.linked === true,
+        ).pipe(Effect.catch(() => Effect.void));
       return;
     }
     if (message.type !== "slack-delivery") return;

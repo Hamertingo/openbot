@@ -107,12 +107,14 @@ export function decodeSignalServerMessage(value: unknown): SignalServerMessage |
         bodyBase64: deliveryBody(value.bodyBase64),
       };
     case "telegram-delivery":
+      if (value.linked !== undefined && value.linked !== true) invalid();
       return {
         type: kind,
         version,
         botId: pattern(value.botId, TELEGRAM_BOT_ID_PATTERN),
         chatId: pattern(value.chatId, TELEGRAM_CHAT_ID_PATTERN),
         bodyBase64: base64(value.bodyBase64, TELEGRAM_UPDATE_BYTES_LIMIT),
+        ...(value.linked === true ? { linked: true as const } : {}),
       };
     case "telegram-call-result":
       if (value.ok === true)

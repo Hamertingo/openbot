@@ -45,14 +45,25 @@ interface TelegramCall {
   messageId?: number;
 }
 
-/** Signal with the OpenBot bot: it passes the chat's updates and answers the host's Bot API calls. */
+/**
+ * Signal with the OpenBot bot: it passes the chat's updates and answers the host's Bot API calls. As
+ * the real socket, it is open only while something holds it, and a call fails when it is closed.
+ */
 class FakeSignal implements MessagingIngress {
   readonly calls: TelegramCall[] = [];
   #handler: TelegramIngressHandler | null = null;
   #messageId = 5_000;
   #updateId = 1;
+  holders = 0;
 
-  acquire = () => () => undefined;
+  acquire = () => {
+    this.holders += 1;
+    let released = false;
+    return () => {
+      if (!released) this.holders -= 1;
+      released = true;
+    };
+  };
   state = () => "online" as const;
   onState = () => () => undefined;
   handle = () => undefined;
@@ -63,28 +74,40 @@ class FakeSignal implements MessagingIngress {
   }
 
   readonly telegram: TelegramGateway = {
-    available: () => true,
+    available: () => this.holders > 0,
     call: (_botId, method, params) =>
-      Effect.sync((): TelegramCallResult => {
-        const call: TelegramCall = { method, params: { ...params } };
-        this.calls.push(call);
-        if (method === "sendMessage") {
-          call.messageId = ++this.#messageId;
-          return { messageId: call.messageId };
-        }
-        if (method === "getMe") return { botId: BOT_ID, username: BOT_USERNAME };
-        return {};
-      }),
+      Effect.suspend(() =>
+        this.holders > 0 ? Effect.void : Effect.die("The host called with the ingress socket closed."),
+      ).pipe(
+        Effect.as(undefined),
+        Effect.flatMap(() =>
+          Effect.sync((): TelegramCallResult => {
+            const call: TelegramCall = { method, params: { ...params } };
+            this.calls.push(call);
+            if (method === "sendMessage") {
+              call.messageId = ++this.#messageId;
+              return { messageId: call.messageId };
+            }
+            if (method === "getMe") return { botId: BOT_ID, username: BOT_USERNAME };
+            return {};
+          }),
+        ),
+      ),
     download: () => Effect.die("This test sends no file."),
     upload: () => Effect.die("This test sends no file."),
   };
 
-  /** Passes one update of the chat as Signal does, and waits until the host has taken it. */
-  async send(update: DynamicRecord): Promise<void> {
+  /**
+   * Passes one update of the chat as Signal does, and waits until the host has taken it. `linked` is
+   * true only on the `/start` update that the account service linked. Signal routes a chat only to an
+   * open socket.
+   */
+  async send(update: DynamicRecord, linked = false): Promise<void> {
     const handler = this.#handler;
     if (!handler) throw new Error("The host does not take Telegram updates.");
+    if (this.holders === 0) throw new Error("The host has no ingress socket open.");
     const body = Buffer.from(JSON.stringify({ update_id: ++this.#updateId, ...update }));
-    await runCauseEffect(handler(BOT_ID, CHAT_ID, body));
+    await runCauseEffect(handler(BOT_ID, CHAT_ID, body, linked));
   }
 
   of(method: string): TelegramCall[] {
@@ -205,7 +228,9 @@ async function linked(options: { autoComplete?: boolean } = {}) {
   });
   await runCauseEffect(messaging.start());
   await runCauseEffect(messaging.connectTelegramChat("group"));
-  await signal.send(message(1, `/start@${BOT_USERNAME} ${CODE}`));
+  // Nothing runs yet: the open link code alone holds the socket for the chat's `/start`.
+  expect(signal.holders).toBe(1);
+  await signal.send(message(1, `/start@${BOT_USERNAME} ${CODE}`), true);
   await waitFor(() => chat()?.state === "connected");
   const added = await runCauseEffect(messaging.addTelegramOrchestrator({}));
   const agent: AgentSummary | undefined = started.service.listAgents().find((entry) => entry.id === added.agentId);
@@ -328,18 +353,55 @@ describe.sequential("Telegram messaging end to end", () => {
     report.approval = { refusedOther: true, accepted: true, interrupted: true };
   });
 
-  it("shows a chat that removed the bot, unlinks it, and leaves on disconnect", async () => {
+  it("keeps a paused chat paused for a made-up code, and leaves the chat on disconnect", async () => {
+    await linked();
+    // The chat's transport holds the socket; the link code no longer does.
+    expect(signal.holders).toBe(1);
+    // Another connection, such as a Slack workspace, keeps the socket open while the chat is paused.
+    const other = signal.acquire();
+    await runCauseEffect(messaging?.setEnabled("telegram", CHAT_ID, false) ?? Effect.succeed(undefined));
+    expect(chat()?.state).toBe("paused");
+    await signal.send(message(2, `/start ${"x".repeat(43)}`));
+    expect(chat()?.state).toBe("paused");
+
+    await runCauseEffect(messaging?.setEnabled("telegram", CHAT_ID, true) ?? Effect.succeed(undefined));
+    await waitFor(() => chat()?.state === "connected");
+    other();
+    // Stopping the chat releases the last holder of the socket. The bot still leaves the chat first.
+    await runCauseEffect(messaging?.disconnectTelegramChat(CHAT_ID) ?? Effect.succeed(undefined));
+    expect(signal.of("leaveChat").map((call) => call.params.chat_id)).toEqual([Number(CHAT_ID)]);
+    expect(unlinked).toEqual([CHAT_ID]);
+    expect(messaging?.telegramOverview().connections).toEqual([]);
+    expect(signal.holders).toBe(0);
+    report.paused = { madeUpCodeIgnored: true, left: true };
+  });
+
+  it("keeps a chat that removed the bot removed, until a new link", async () => {
     await linked();
     await signal.send({
       my_chat_member: { chat: CHAT, new_chat_member: { user: { id: Number(BOT_ID), is_bot: true }, status: "kicked" } },
     });
     await waitFor(() => chat()?.state === "removed");
     expect(unlinked).toEqual([CHAT_ID]);
+    // The transport stopped, so the socket's state cannot show the chat as connected again.
+    expect(signal.holders).toBe(0);
+    await expect(runCauseEffect(messaging?.reconnect("telegram", CHAT_ID) ?? Effect.void)).rejects.toThrow();
+    await expect(runCauseEffect(messaging?.setEnabled("telegram", CHAT_ID, true) ?? Effect.void)).rejects.toThrow();
+    expect(chat()?.state).toBe("removed");
 
-    await runCauseEffect(messaging?.disconnectTelegramChat(CHAT_ID) ?? Effect.succeed(undefined));
-    expect(signal.of("leaveChat").map((call) => call.params.chat_id)).toEqual([Number(CHAT_ID)]);
+    // A restart does not start it either.
+    await runCauseEffect(messaging?.stop() ?? Effect.void);
+    await runCauseEffect(messaging?.start() ?? Effect.void);
+    expect(chat()?.state).toBe("removed");
+
+    // A new link brings it back.
+    await runCauseEffect(messaging?.connectTelegramChat("group") ?? Effect.void);
+    await signal.send(message(3, `/start@${BOT_USERNAME} ${CODE}`), true);
+    await waitFor(() => chat()?.state === "connected");
+
+    await runCauseEffect(messaging?.disconnectTelegramChat(CHAT_ID) ?? Effect.void);
     expect(messaging?.telegramOverview().connections).toEqual([]);
-    report.removed = { unlinked: unlinked.length, left: true };
+    report.removed = { unlinked: unlinked.length, keptRemoved: true, relinked: true };
 
     mkdirSync(REPORT_DIR, { recursive: true });
     writeFileSync(join(REPORT_DIR, "report.json"), `${JSON.stringify(report, null, 2)}\n`);

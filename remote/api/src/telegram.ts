@@ -39,7 +39,7 @@ type TelegramRequestBody =
 
 export type TelegramAnswer<A> = { ok: true; result: A } | ({ ok: false } & TelegramCallFailure);
 
-export class TelegramApiError extends Schema.TaggedError<TelegramApiError>()("TelegramApiError", {
+class TelegramApiError extends Schema.TaggedError<TelegramApiError>()("TelegramApiError", {
   message: Schema.String,
 }) {}
 

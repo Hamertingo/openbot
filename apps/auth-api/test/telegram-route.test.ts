@@ -216,7 +216,7 @@ describe("Telegram chat routes", () => {
           ],
         }),
       ),
-    ).resolves.toEqual(["-1001"]);
+    ).resolves.toEqual([{ id: "-1001", botId: BOT_ID, linkedAt: 10 }]);
 
     await expect(
       runApiEffect(controlPlane.disconnectTelegramChat("host-1", hosts["host-1"], "not-a-chat")),

@@ -179,8 +179,10 @@ export function createRemoteApiApp(
         const update = body ? telegramUpdate(body) : null;
         if (!body || !update || !signal.acceptTelegramRequest(`chat:${botId}:${update.chatId}`))
           return emptyResponse(200);
-        if (update.linkCode) await runtime.runPromise(signal.linkTelegramChat(botId, update.chatId, update.linkCode));
-        signal.deliverTelegram(botId, update.chatId, body, update.callbackQueryId);
+        const linked = update.linkCode
+          ? await runtime.runPromise(signal.linkTelegramChat(botId, update.chatId, update.linkCode))
+          : false;
+        signal.deliverTelegram(botId, update.chatId, body, update.callbackQueryId, linked);
         return emptyResponse(200);
       },
       { parse: "none" },

@@ -33,7 +33,7 @@ interface SlackSigningSecret {
   secret: string;
 }
 
-export interface TelegramBot {
+interface TelegramBot {
   botId: string;
   // The bot token. Only Signal has it: never log it or put it in a frame.
   token: string;

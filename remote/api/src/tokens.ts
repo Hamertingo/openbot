@@ -108,7 +108,7 @@ export class RemoteTokenService {
   readonly #validateTelegramRoute: (
     hostId: string,
     chats: TelegramRouteChat[],
-  ) => Effect.Effect<string[], RemoteTokenError>;
+  ) => Effect.Effect<TelegramRouteChat[], RemoteTokenError>;
   readonly #linkTelegramChat: (
     botId: string,
     chatId: string,
@@ -131,7 +131,10 @@ export class RemoteTokenService {
       // Asks the account service which links of a route are current. Without it, none is.
       validateSlackRoute?: (hostId: string, teams: SlackRouteTeam[]) => Effect.Effect<string[], RemoteTokenError>;
       // Asks the account service which chats of a Telegram route are current. Without it, none is.
-      validateTelegramRoute?: (hostId: string, chats: TelegramRouteChat[]) => Effect.Effect<string[], RemoteTokenError>;
+      validateTelegramRoute?: (
+        hostId: string,
+        chats: TelegramRouteChat[],
+      ) => Effect.Effect<TelegramRouteChat[], RemoteTokenError>;
       // Asks the account service to link a chat with a link code. Without it, no code links a chat.
       linkTelegramChat?: (
         botId: string,

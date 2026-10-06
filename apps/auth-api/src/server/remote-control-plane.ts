@@ -1798,7 +1798,7 @@ export class RemoteControlPlane {
     function* (
       this: RemoteControlPlane,
       input: { hostId: string; chats: TelegramRouteChat[] },
-    ): Effect.fn.Return<string[], RemoteFailure, RemoteDependencies> {
+    ): Effect.fn.Return<TelegramRouteChat[], RemoteFailure, RemoteDependencies> {
       const dependencies = yield* RemoteDependencies;
       if (input.chats.length === 0) return [];
       const rows = yield* remoteCall(() =>
@@ -1808,9 +1808,10 @@ export class RemoteControlPlane {
           .all<{ bot_id: string; chat_id: string; linked_at: number }>(),
       );
       const linked = new Map(rows.results.map((row) => [`${row.bot_id}:${row.chat_id}`, row.linked_at]));
+      // Each current link whole, so Signal keeps only these bot, chat and time triples.
       return input.chats
         .filter((chat) => linked.get(`${chat.botId}:${chat.id}`) === chat.linkedAt)
-        .map((chat) => chat.id);
+        .map((chat) => ({ id: chat.id, botId: chat.botId, linkedAt: chat.linkedAt }));
     },
     (operation) => operation.pipe(Effect.provide(this.#layer)),
   ).bind(this);

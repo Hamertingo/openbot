@@ -19,6 +19,7 @@ import type {
 } from "@openbot/contracts/ipc";
 import { MESSAGING_CONNECTION_STATES } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isOneOf, isString } from "@openbot/contracts/runtime-values";
+import { TELEGRAM_LINK_CODE_TTL_SECONDS } from "@openbot/contracts/signal-protocol/telegram-route";
 import { SLACK_ORCHESTRATOR_AVATAR } from "@openbot/contracts/slack-app";
 import { TELEGRAM_ORCHESTRATOR_AVATAR } from "@openbot/contracts/telegram-app";
 import { sourceText } from "@openbot/i18n/source";
@@ -165,6 +166,8 @@ export class MessagingService {
   readonly #telegramApp: TelegramAppPort | null;
   readonly #sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "mutate"> | null;
   #started = false;
+  /** Holds the ingress socket open while a Telegram link code waits for its chat. */
+  #telegramLinkLease: { release: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
   #scope = Scope.makeUnsafe();
 
   constructor(options: MessagingServiceOptions) {
@@ -194,7 +197,7 @@ export class MessagingService {
     );
     this.#threads.setContextSource((link, origin) => this.#promptContext(link, origin));
     this.#ingress?.handle((workspaceId, delivery) => this.deliverSlack(workspaceId, delivery));
-    this.#ingress?.handleTelegram((botId, chatId, body) => this.deliverTelegram(botId, chatId, body));
+    this.#ingress?.handleTelegram((botId, chatId, body, linked) => this.deliverTelegram(botId, chatId, body, linked));
     const records = this.#threads.store.connections();
     yield* this.#credentials.retain(new Set(records.map((record) => record.connectionId)));
     yield* Effect.forEach(
@@ -212,6 +215,7 @@ export class MessagingService {
     this.#threads.setContextSource(null);
     this.#ingress?.handle(null);
     this.#ingress?.handleTelegram(null);
+    this.#endTelegramLinkLease();
     yield* Effect.forEach(
       [...this.#live.values()],
       (live) => {
@@ -256,12 +260,7 @@ export class MessagingService {
     platform: MessagingPlatform,
     workspaceId: string,
   ): Effect.fn.Return<void, MessagingOperationFailed> {
-    const record = yield* messagingStep(() => this.#requireConnection(platform, workspaceId));
-    // The bot left the chat, and the chat is unlinked: only a new link brings it back.
-    if (record.lastErrorCode === "removed")
-      return yield* new MessagingOperationFailed({
-        cause: new Error(sourceText("error.messaging.telegramNotConnected")),
-      });
+    const record = yield* messagingStep(() => this.#requireLinked(platform, workspaceId));
     yield* this.#stopConnection(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, { enabled: true, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
@@ -275,7 +274,7 @@ export class MessagingService {
     workspaceId: string,
     enabled: boolean,
   ): Effect.fn.Return<void, MessagingOperationFailed> {
-    const record = yield* messagingStep(() => this.#requireConnection(platform, workspaceId));
+    const record = yield* messagingStep(() => this.#requireLinked(platform, workspaceId));
     yield* this.#stopConnection(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, { enabled, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
@@ -458,10 +457,25 @@ export class MessagingService {
     this: MessagingService,
     place: ConnectTelegramChatInput["place"],
   ) {
-    const { app } = yield* messagingStep(() => this.#requireTelegram());
-    const link = yield* app.createLink();
+    const { app, ingress } = yield* messagingStep(() => this.#requireTelegram());
+    // Signal routes the new chat to this host's socket when the chat sends the code. With no
+    // connection running, nothing else holds the socket open, so the code holds it until it expires.
+    this.#endTelegramLinkLease();
+    const release = ingress.acquire();
+    const timer = setTimeout(() => this.#endTelegramLinkLease(), TELEGRAM_LINK_CODE_TTL_SECONDS * 1_000);
+    timer.unref?.();
+    this.#telegramLinkLease = { release, timer };
+    const link = yield* app.createLink().pipe(Effect.onError(() => Effect.sync(() => this.#endTelegramLinkLease())));
     yield* messagingIo(() => app.openExternal(telegramLinkUrl(link.botUsername, link.code, place)));
   }).bind(this);
+
+  #endTelegramLinkLease(): void {
+    const lease = this.#telegramLinkLease;
+    this.#telegramLinkLease = null;
+    if (!lease) return;
+    clearTimeout(lease.timer);
+    lease.release();
+  }
 
   /**
    * The bot leaves the chat, and the chat is unlinked from this host. The conversations stay in
@@ -473,13 +487,21 @@ export class MessagingService {
   ) {
     const { app, ingress } = yield* messagingStep(() => this.#requireTelegram());
     const record = yield* messagingStep(() => this.#requireConnection("telegram", chatId));
-    yield* this.#stopConnection(record.connectionId);
     const botId = this.#credentials.get(record.connectionId)?.botId;
-    // Before the unlink: Signal accepts a call only for a chat that is routed to this host.
-    if (botId && ingress.telegram.available())
-      yield* ingress.telegram
-        .call(botId, "leaveChat", { chat_id: Number(chatId) })
-        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+    // The chat's transport may be the last holder of the socket. The call needs it open, and it must
+    // come before the unlink: Signal accepts a call only for a chat that is routed to this host.
+    yield* Effect.acquireUseRelease(
+      Effect.sync(() => ingress.acquire()),
+      () =>
+        Effect.gen({ self: this }, function* () {
+          yield* this.#stopConnection(record.connectionId);
+          if (botId && record.lastErrorCode !== "removed")
+            yield* ingress.telegram
+              .call(botId, "leaveChat", { chat_id: Number(chatId) })
+              .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+        }),
+      (release) => Effect.sync(release),
+    );
     yield* this.#credentials.clear(record.connectionId);
     yield* messagingStep(() =>
       this.#threads.store.updateConnection(record.connectionId, { enabled: false, lastErrorCode: null }),
@@ -489,17 +511,19 @@ export class MessagingService {
 
   /**
    * One Telegram update of a chat routed to this host, which Signal has checked. A `/start <code>`
-   * links the chat: Signal and the account service have already matched the code to this host.
+   * links the chat only when Signal marks it `linked`: the account service matched the code to this
+   * host. Anyone in a routed chat can send a `/start` with a made-up code.
    */
   readonly deliverTelegram = Effect.fn("MessagingService.deliverTelegram")(function* (
     this: MessagingService,
     botId: string,
     chatId: string,
     body: Uint8Array,
+    linked: boolean,
   ): Effect.fn.Return<void, MessagingOperationFailed> {
     const update = parseTelegramUpdate(body);
     if (!update) return;
-    const link = telegramLink(update);
+    const link = linked ? telegramLink(update) : null;
     if (link) return yield* this.#linkTelegramChat(botId, chatId, link.title);
     const record = this.#threads.store.connectionForWorkspace("telegram", chatId);
     // A chat that both the production and the development bot are in answers only its own bot.
@@ -535,6 +559,8 @@ export class MessagingService {
     });
     const updated = this.#threads.store.connection(record.connectionId);
     if (updated) yield* this.#startConnection(updated);
+    // The chat's transport holds the socket from here.
+    this.#endTelegramLinkLease();
     const live = this.#live.get(record.connectionId);
     if (live)
       yield* live.adapter
@@ -569,6 +595,8 @@ export class MessagingService {
     const credentials = this.#credentials.get(record.connectionId);
     const driver = this.#drivers.get(record.platform);
     if (!driver || !credentials?.[driver.credentialKey]) return;
+    // A chat that removed the bot is unlinked: its transport would report the socket, not the chat.
+    if (record.lastErrorCode === "removed") return;
     const live: LiveConnection = {
       record,
       adapter: driver.createAdapter(credentials, {
@@ -688,6 +716,9 @@ export class MessagingService {
               ?.unlink(live.record.workspaceId)
               .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
       if (unlink) yield* unlink.pipe(Effect.catch((error) => Effect.sync(() => this.#warn(error.cause))));
+      // The summary then shows the stored state, which a reconnect of the socket cannot change.
+      if (state === "removed" && this.#live.get(live.record.connectionId) === live)
+        yield* this.#stopConnection(live.record.connectionId);
     }
   });
 
@@ -1186,6 +1217,13 @@ export class MessagingService {
       throw new Error(
         sourceText(platform === "telegram" ? "error.messaging.telegramNotConnected" : "error.messaging.notConnected"),
       );
+    return record;
+  }
+
+  /** A connection that can start again. A chat that removed the bot needs a new link first. */
+  #requireLinked(platform: MessagingPlatform, workspaceId: string): MessagingConnectionRecord {
+    const record = this.#requireConnection(platform, workspaceId);
+    if (record.lastErrorCode === "removed") throw new Error(sourceText("error.messaging.telegramNotConnected"));
     return record;
   }
 

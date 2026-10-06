@@ -133,12 +133,32 @@ describe("Telegram route", () => {
     expect((await postUpdate(start)).status).toBe(200);
     expect(links).toEqual([[BOT_ID, "-300", LINK_CODE]]);
     expect(Buffer.from(JSON.parse(ingress.messages.at(-1) ?? "{}").bodyBase64, "base64").toString()).toBe(start);
+    // Only the update that the account service linked says so: the host links a chat only on it.
+    expect(JSON.parse(ingress.messages.at(-1) ?? "{}").linked).toBe(true);
     await postUpdate(JSON.stringify({ message: { chat: { id: -300 }, text: "next" } }));
     expect(ingress.messages).toHaveLength(2);
+    expect(JSON.parse(ingress.messages.at(-1) ?? "{}").linked).toBeUndefined();
+
+    // A made-up code in a routed chat reaches the host, but not as a link.
+    await postUpdate(JSON.stringify({ message: { chat: { id: -300 }, text: `/start ${"e".repeat(40)}` } }));
+    expect(ingress.messages).toHaveLength(3);
+    expect(JSON.parse(ingress.messages.at(-1) ?? "{}").linked).toBeUndefined();
 
     // A code that links nothing routes nothing.
     await postUpdate(JSON.stringify({ message: { chat: { id: -400 }, text: `/start ${"d".repeat(40)}` } }));
-    expect(ingress.messages).toHaveLength(2);
+    expect(ingress.messages).toHaveLength(3);
+  });
+
+  it("keeps from a ticket only the links that the account service confirms whole", async () => {
+    // The account service still links the chat, but with another link time: a revoked link must not
+    // come back on its chat ID alone.
+    const { connect, postUpdate } = await telegramRoute({
+      validateTelegramRoute: (_hostId, chats) =>
+        Effect.succeed(chats.map((chat) => ({ ...chat, linkedAt: chat.linkedAt + 1 }))),
+    });
+    const ingress = await connect("ingress", [{ id: "-500", linkedAt: 1_000 }]);
+    await postUpdate(JSON.stringify({ message: { chat: { id: -500 }, text: "hi" } }));
+    expect(ingress.messages).toHaveLength(0);
   });
 
   it("signs file and upload tokens, and an upload token works once", async () => {
@@ -257,7 +277,7 @@ async function telegramRoute(provider: Partial<RemoteTokenProvider> = {}) {
       verifySlackRoute: () => Effect.succeed({ teams: [] }),
       validateSlackRoute: () => Effect.succeed([]),
       verifyTelegramRoute: (token, hostId) => routes.verifyTelegramRoute(token, hostId),
-      validateTelegramRoute: (_hostId, chats) => Effect.succeed(chats.map((chat) => chat.id)),
+      validateTelegramRoute: (_hostId, chats) => Effect.succeed(chats),
       ...provider,
     },
     8,
