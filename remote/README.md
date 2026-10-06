@@ -1,8 +1,9 @@
 # OpenBot Remote
 
 This directory holds our own control plane for WebRTC connections. The Remote API relays SDP and ICE.
-Team files, chats, commands and video never pass through the Remote API or Cloudflare. The one exception
-is the OpenBot Slack app: see [Slack requests](#slack-requests).
+Team files, chats, commands and video never pass through the Remote API or Cloudflare. The exceptions
+are the OpenBot Slack app and the OpenBot Telegram bot: see [Slack requests](#slack-requests) and
+[Telegram updates](#telegram-updates).
 
 ## Flow
 
@@ -48,6 +49,30 @@ host. Its public key
 must be in the ticket JWKS that Signal loads (`REMOTE_TICKET_PUBLIC_JWKS` on the Worker, or
 `REMOTE_TICKET_PUBLIC_KEYS` here). Signal does not store or log the body. Without
 `SLACK_SIGNING_SECRET`, the Slack route answers 503.
+
+## Telegram updates
+
+One OpenBot bot serves every user, and only Signal has its token. `TELEGRAM_BOT_TOKENS` is a
+comma-separated list of bot tokens (`<bot ID>:<secret>`), because the production and development
+bots share Signal. `TELEGRAM_WEBHOOK_SECRET` (at least 32 bytes) is required with them: the webhook
+secret of each bot is the base64url HMAC-SHA256 of `telegram-webhook:<bot ID>` with it. A malformed
+value turns off only Telegram. With `TELEGRAM_WEBHOOK_ORIGIN`, Signal sets the webhook of each bot to
+`<origin>/v1/telegram/updates/<bot ID>` when it starts; a failure is logged and Signal runs on.
+
+Telegram posts each update to `/v1/telegram/updates/<bot ID>`. Signal checks the secret header,
+reads only the chat ID, the callback query ID and a `/start <code>` link code, and passes the exact
+body to the `ingress` socket of the chat's host. A link code makes Signal ask the account service to
+link the chat (`/v2/remote/telegram-route/link`), and routes the chat to that host at once. Signal
+answers 200 to each signed update, also when no host holds the chat: Telegram holds back the bot's
+other updates while one fails.
+
+An `ingress` socket names its chats with a Telegram route ticket: an ES256 JWT with the audience
+`openbot-telegram-route`, signed with the key of the Slack route ticket. When `ready` names the
+`telegram` capability, the host calls the Bot API through the socket (`telegram-call`). Signal
+accepts only the methods and parameters of `TelegramCallParams`, only for the chats routed to that
+socket, and returns only the reduced result. A host downloads a file from `/v1/telegram/files/<token>`
+and posts a document to `/v1/telegram/uploads/<token>`. These tokens are signed, expire after two
+minutes, and an upload token works once. Signal does not store or log an update or a file.
 
 ## Production requirements
 

@@ -136,7 +136,11 @@ import {
   decodeDynamicIslandPreference,
   decodeDynamicIslandPresentation,
 } from "./dynamic-island-decoding";
-import { decodeAddSlackOrchestratorReply, decodeSlackOverviewReply } from "./messaging-decoding";
+import {
+  decodeAddSlackOrchestratorReply,
+  decodeSlackOverviewReply,
+  decodeTelegramOverviewReply,
+} from "./messaging-decoding";
 import { decodeProviderRuntimeSnapshot } from "./provider-runtime";
 import {
   decodeAgentInstallation,
@@ -625,6 +629,12 @@ const openbotApi: OpenBotDesktopApi = {
     reconnectSlackWorkspace: decodeVoid,
     setSlackEnabled: decodeVoid,
     addSlackOrchestrator: decodeAddSlackOrchestratorReply,
+    getTelegramOverview: decodeTelegramOverviewReply,
+    connectTelegramChat: decodeVoid,
+    disconnectTelegramChat: decodeVoid,
+    reconnectTelegramChat: decodeVoid,
+    setTelegramEnabled: decodeVoid,
+    addTelegramOrchestrator: decodeAddSlackOrchestratorReply,
   }),
   hostAdmin: bridgeGroup(IPC_ENDPOINTS.hostAdmin, {
     updateIdentity: decodeServer,

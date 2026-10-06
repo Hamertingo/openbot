@@ -1,6 +1,13 @@
 import { SLACK_ROUTE_TTL_SECONDS, type SlackRouteTeam } from "@openbot/contracts/signal-protocol/slack-route";
-import { Context, Effect, Layer, Result } from "effect";
 import {
+  TELEGRAM_CAPABILITY,
+  TELEGRAM_ROUTE_TTL_SECONDS,
+  type TelegramCallResult,
+  type TelegramRouteChat,
+} from "@openbot/contracts/signal-protocol/telegram-route";
+import { Context, Effect, Fiber, Layer, Result } from "effect";
+import {
+  type DecodedSignalClientMessage,
   decodeSignalClientMessage,
   encodeSignalServerMessage,
   type IceServer,
@@ -11,12 +18,19 @@ import {
   type SignalServerMessage,
   type SlackDeliveryKind,
   type SlackDeliveryStatus,
+  type TelegramCall,
 } from "./protocol";
-import { RemoteTokenError } from "./tokens";
+import { runTelegramCall, type SignalTelegram, type TelegramAnswer, telegramFailure } from "./telegram";
+import { RemoteTokenError, type TelegramChatLink } from "./tokens";
 
 /** The workspaces a verified route ticket names, each with the time it was linked to the host. */
 interface SlackRoute {
   teams: SlackRouteTeam[];
+}
+
+/** The chats a verified Telegram route ticket names, each with the time it was linked to the host. */
+interface TelegramRoute {
+  chats: TelegramRouteChat[];
 }
 
 export interface RemoteTokenProvider {
@@ -28,6 +42,15 @@ export interface RemoteTokenProvider {
   /** Without a route verifier, no ingress socket connects. */
   verifySlackRoute?(token: string, hostId: string): Effect.Effect<SlackRoute, RemoteTokenError>;
   validateSlackRoute?(hostId: string, teams: SlackRouteTeam[]): Effect.Effect<string[], RemoteTokenError>;
+  /** Without a Telegram route verifier, an ingress socket receives no chat. */
+  verifyTelegramRoute?(token: string, hostId: string): Effect.Effect<TelegramRoute, RemoteTokenError>;
+  validateTelegramRoute?(hostId: string, chats: TelegramRouteChat[]): Effect.Effect<string[], RemoteTokenError>;
+  /** `null` when the code is not valid or the chat belongs to another host. */
+  linkTelegramChat?(
+    botId: string,
+    chatId: string,
+    code: string,
+  ): Effect.Effect<TelegramChatLink | null, RemoteTokenError>;
   revokeHost?(hostId: string, authEpoch: number): void;
   revokeSession?(sessionId: string): void;
 }
@@ -57,6 +80,8 @@ interface AuthenticatedPeer {
   // `ingress` only: the Slack workspaces whose requests this socket receives.
   // The routes this socket holds: `<app ID>:<workspace ID>`.
   slackTeams: string[];
+  // `ingress` only: the Telegram chats whose updates this socket receives, `<bot ID>:<chat ID>`.
+  telegramChats: string[];
 }
 
 interface ActiveConnection {
@@ -76,6 +101,10 @@ export interface SignalMetrics {
   activePeerConnections: number;
   slackDeliveries: number;
   slackDeliveriesUnavailable: number;
+  telegramDeliveries: number;
+  telegramDeliveriesUnrouted: number;
+  telegramCalls: number;
+  telegramCallsRefused: number;
 }
 
 /** One signed Slack request for a workspace. Signal passes it on and keeps nothing of it. */
@@ -129,6 +158,12 @@ const MAXIMUM_EXPIRATION_TIMER_MILLISECONDS = 24 * 60 * 60_000;
 const INGRESS_RATE_FACTOR = 10;
 // Slack sends at most 30,000 events an hour for one app in one workspace.
 const SLACK_TEAM_RATE_FACTOR = 2;
+// A host can answer a callback query that Signal delivered to it in this time. Telegram allows less.
+const TELEGRAM_CALLBACK_TTL_MILLISECONDS = 15 * 60_000;
+const MAXIMUM_TELEGRAM_CALLBACKS = 100_000;
+// The Bot API calls of one socket that wait for an answer. A call beyond them is answered 429.
+const MAXIMUM_PENDING_TELEGRAM_CALLS = 32;
+const TELEGRAM_FORBIDDEN = telegramFailure(403, "forbidden");
 
 export class SignalService {
   readonly #tokens: RemoteTokenProvider;
@@ -144,6 +179,14 @@ export class SignalService {
   // after the account service revoked it. A host that lost a workspace keeps its last ticket until it
   // expires; this keeps that ticket from taking the route back.
   readonly #slackRouteFloor = new Map<string, number>();
+  // Telegram chat (`<bot ID>:<chat ID>`) to its `ingress` socket, with a floor like the Slack one.
+  readonly #telegramChats = new Map<string, string>();
+  readonly #telegramRouteFloor = new Map<string, number>();
+  // A delivered callback query (`<bot ID>:<query ID>`) to the socket that can answer it. The TTL is
+  // the same for each entry, so the oldest entry is first.
+  readonly #telegramCallbacks = new Map<string, { socketId: string; expiresAt: number }>();
+  readonly #telegramCalls = new Map<string, Set<Fiber.Fiber<void>>>();
+  readonly #telegram: SignalTelegram | null;
   readonly #pendingDeliveries = new Map<string, PendingDelivery>();
   readonly #slackLimits: SlackDeliveryLimits;
   readonly #connections = new Map<string, ActiveConnection>();
@@ -157,6 +200,7 @@ export class SignalService {
   // The revocations below are in memory. Until every route ticket issued before this start has
   // expired, the account service confirms each link.
   readonly #validateSlackRoutesUntil = Date.now() + SLACK_ROUTE_TTL_SECONDS * 1_000;
+  readonly #validateTelegramRoutesUntil = Date.now() + TELEGRAM_ROUTE_TTL_SECONDS * 1_000;
   #lastRatePruneAt = 0;
   readonly #metrics: SignalMetrics = {
     acceptedConnections: 0,
@@ -167,6 +211,10 @@ export class SignalService {
     activePeerConnections: 0,
     slackDeliveries: 0,
     slackDeliveriesUnavailable: 0,
+    telegramDeliveries: 0,
+    telegramDeliveriesUnrouted: 0,
+    telegramCalls: 0,
+    telegramCallsRefused: 0,
   };
 
   readonly dependencies: Layer.Layer<SignalTokens>;
@@ -177,6 +225,8 @@ export class SignalService {
     maximumConnectionsPerIp = 32,
     maximumMessagesPerMinute = 600,
     slackLimits: SlackDeliveryLimits = DEFAULT_SLACK_DELIVERY_LIMITS,
+    // The Bot API and the file tokens. Without them, Telegram is off.
+    telegram: SignalTelegram | null = null,
   ) {
     this.#tokens = tokens;
     this.dependencies = SignalTokens.layer(tokens);
@@ -184,6 +234,12 @@ export class SignalService {
     this.#maximumConnectionsPerIp = maximumConnectionsPerIp;
     this.#maximumMessagesPerMinute = maximumMessagesPerMinute;
     this.#slackLimits = slackLimits;
+    this.#telegram = telegram;
+  }
+
+  /** The Bot API and the file tokens, or `null` when Telegram is off. */
+  get telegram(): SignalTelegram | null {
+    return this.#telegram;
   }
 
   close(): void {
@@ -216,7 +272,7 @@ export class SignalService {
         this.#fail(socket, "invalid_message", "Signal message is too large.", 1009);
         return;
       }
-      let message: SignalClientMessage;
+      let message: DecodedSignalClientMessage;
       try {
         message = decodeSignalClientMessage(JSON.parse(text));
       } catch {
@@ -248,6 +304,7 @@ export class SignalService {
           connectionId: message.connectionId,
           resumeToken: yield* tokens.issueResumeToken(peer.claims),
           iceServers: this.#tokens.iceServers(peer.claims),
+          ...this.#capabilities(peer.peer),
         });
         return;
       }
@@ -267,6 +324,14 @@ export class SignalService {
             ? { contentType: message.contentType, body: message.body }
             : {}),
         });
+        return;
+      }
+      if (message.type === "telegram-call") {
+        if (peer.peer !== "ingress") {
+          this.#fail(socket, "permission_denied", "Only an ingress socket can call the Bot API.");
+          return;
+        }
+        yield* this.#startTelegramCall(peer, message);
         return;
       }
       const connection = this.#connections.get(message.connectionId);
@@ -299,6 +364,12 @@ export class SignalService {
         for (const route of peer.slackTeams) {
           if (this.#slackTeams.get(route) === socket.id) this.#slackTeams.delete(route);
         }
+        for (const route of peer.telegramChats) {
+          if (this.#telegramChats.get(route) === socket.id) this.#telegramChats.delete(route);
+        }
+        const calls = this.#telegramCalls.get(socket.id);
+        this.#telegramCalls.delete(socket.id);
+        if (calls) yield* Fiber.interruptAll([...calls]);
         for (const [requestId, pending] of [...this.#pendingDeliveries]) {
           if (pending.socketId === socket.id) this.#settleDelivery(requestId, this.#unavailable());
         }
@@ -368,6 +439,15 @@ export class SignalService {
     if (floor > through) return;
     this.#slackRouteFloor.set(route, through + 1);
     this.#slackTeams.delete(route);
+  }
+
+  /** The account service unlinked a Telegram chat, or moved it, after `through`'s link. */
+  revokeTelegramRoute(botId: string, chatId: string, through: number): void {
+    const route = telegramRouteKey(botId, chatId);
+    const floor = this.#telegramRouteFloor.get(route) ?? 0;
+    if (floor > through) return;
+    this.#telegramRouteFloor.set(route, through + 1);
+    this.#telegramChats.delete(route);
   }
 
   revokeSession(sessionId: string): void {
@@ -453,6 +533,128 @@ export class SignalService {
     return this.#acceptRateKey(`slack-${key}`, Date.now(), key.startsWith("team:") ? SLACK_TEAM_RATE_FACTOR : 1);
   }
 
+  /** The rate limit for Telegram updates: by chat for a signed update, by address for a refused one. */
+  acceptTelegramRequest(key: `chat:${string}` | `address:${string}`): boolean {
+    return this.#acceptRateKey(`telegram-${key}`, Date.now());
+  }
+
+  /**
+   * Passes one Telegram update to the `ingress` socket of the chat's host. Telegram does not wait for
+   * the host, so nothing comes back. Returns `false` when no socket holds the chat.
+   */
+  deliverTelegram(botId: string, chatId: string, body: Uint8Array, callbackQueryId: string | null): boolean {
+    const socketId = this.#telegramChats.get(telegramRouteKey(botId, chatId));
+    const ingress = socketId ? this.#peers.get(socketId) : undefined;
+    if (!ingress) {
+      this.#metrics.telegramDeliveriesUnrouted += 1;
+      return false;
+    }
+    if (callbackQueryId) this.#rememberCallback(telegramRouteKey(botId, callbackQueryId), ingress.socket.id);
+    this.#metrics.telegramDeliveries += 1;
+    this.#send(ingress.socket, {
+      type: "telegram-delivery",
+      version: 1,
+      botId,
+      chatId,
+      bodyBase64: Buffer.from(body).toString("base64"),
+    });
+    return true;
+  }
+
+  /**
+   * Links a chat with a link code from its `/start` message, and routes it to the newest `ingress`
+   * socket of the host that asked for the code. Returns `false` when the code links nothing.
+   */
+  readonly linkTelegramChat = Effect.fn("Signal.linkTelegramChat")((botId: string, chatId: string, code: string) =>
+    Effect.gen({ self: this }, function* () {
+      const tokens = yield* SignalTokens;
+      if (!this.#telegram || !tokens.linkTelegramChat) return false;
+      const link = yield* tokens.linkTelegramChat(botId, chatId, code).pipe(Effect.catch(() => Effect.succeed(null)));
+      if (!link) return false;
+      const route = telegramRouteKey(botId, chatId);
+      if (link.linkedAt < (this.#telegramRouteFloor.get(route) ?? 0)) return false;
+      this.#telegramRouteFloor.set(route, link.linkedAt);
+      let ingress: AuthenticatedPeer | null = null;
+      for (const peer of this.#peers.values()) {
+        if (peer.peer === "ingress" && peer.claims.hostId === link.hostId) ingress = peer;
+      }
+      if (ingress) {
+        this.#telegramChats.set(route, ingress.socket.id);
+        ingress.telegramChats.push(route);
+      } else this.#telegramChats.delete(route);
+      return true;
+    }),
+  );
+
+  #rememberCallback(key: string, socketId: string, now = Date.now()): void {
+    for (const [callback, entry] of this.#telegramCallbacks) {
+      if (entry.expiresAt > now && this.#telegramCallbacks.size < MAXIMUM_TELEGRAM_CALLBACKS) break;
+      this.#telegramCallbacks.delete(callback);
+    }
+    this.#telegramCallbacks.delete(key);
+    this.#telegramCallbacks.set(key, { socketId, expiresAt: now + TELEGRAM_CALLBACK_TTL_MILLISECONDS });
+  }
+
+  /**
+   * A socket calls only for a configured bot, only into a chat routed to it, and answers only a
+   * callback query delivered to it.
+   */
+  #telegramCallAllowed(peer: AuthenticatedPeer, call: TelegramCall): boolean {
+    if (!this.#telegram?.bot.hasBot(call.botId)) return false;
+    if (call.method === "getMe") return true;
+    if (call.method === "answerCallbackQuery") {
+      const callback = this.#telegramCallbacks.get(telegramRouteKey(call.botId, call.params.callback_query_id));
+      return Boolean(callback && callback.socketId === peer.socket.id && callback.expiresAt > Date.now());
+    }
+    return this.#telegramChats.get(telegramRouteKey(call.botId, String(call.params.chat_id))) === peer.socket.id;
+  }
+
+  readonly #startTelegramCall = Effect.fn("Signal.startTelegramCall")((peer: AuthenticatedPeer, call: TelegramCall) =>
+    Effect.gen({ self: this }, function* () {
+      const socket = peer.socket;
+      const answer = (result: TelegramAnswer<TelegramCallResult>) => {
+        if (this.#peers.get(socket.id) !== peer) return;
+        this.#send(socket, {
+          type: "telegram-call-result",
+          version: 1,
+          requestId: call.requestId,
+          ...(result.ok ? { ok: true, result: result.result } : result),
+        });
+      };
+      const telegram = this.#telegram;
+      if (!telegram || !this.#telegramCallAllowed(peer, call)) {
+        this.#metrics.telegramCallsRefused += 1;
+        answer(TELEGRAM_FORBIDDEN);
+        return;
+      }
+      const pending = this.#telegramCalls.get(socket.id) ?? new Set<Fiber.Fiber<void>>();
+      if (pending.size >= MAXIMUM_PENDING_TELEGRAM_CALLS) {
+        this.#metrics.telegramCallsRefused += 1;
+        answer(telegramFailure(429, "Too Many Requests: too many pending calls", 1));
+        return;
+      }
+      this.#telegramCalls.set(socket.id, pending);
+      this.#metrics.telegramCalls += 1;
+      // The call runs on its own, so the socket's other frames do not wait for the Bot API.
+      const fiber = yield* runTelegramCall(telegram, call).pipe(
+        Effect.flatMap((result) =>
+          Effect.sync(() => {
+            if (result.ok && call.method === "answerCallbackQuery")
+              this.#telegramCallbacks.delete(telegramRouteKey(call.botId, call.params.callback_query_id));
+            answer(result);
+          }),
+        ),
+        Effect.forkDetach,
+      );
+      pending.add(fiber);
+      fiber.addObserver(() => pending.delete(fiber));
+    }),
+  );
+
+  #capabilities(peer: AuthenticatedPeer["peer"]): { capabilities?: string[] } {
+    return peer === "ingress" && this.#telegram ? { capabilities: [TELEGRAM_CAPABILITY] } : {};
+  }
+
   #settleDelivery(requestId: string, response: SlackDeliveryResponse): void {
     const pending = this.#pendingDeliveries.get(requestId);
     if (!pending) return;
@@ -503,6 +705,7 @@ export class SignalService {
           if (message.peer === "client" && claims.role === "host")
             return yield* new RemoteTokenError({ message: "Member role required." });
           let slackRoute: SlackRoute = { teams: [] };
+          let telegramRoute: TelegramRoute = { chats: [] };
           if (message.peer === "ingress") {
             if (!message.slackRoute || !tokens.verifySlackRoute)
               return yield* new RemoteTokenError({ message: "Slack route required." });
@@ -513,11 +716,26 @@ export class SignalService {
               const linked = new Set(yield* tokens.validateSlackRoute(claims.hostId, slackRoute.teams));
               slackRoute = { teams: slackRoute.teams.filter((team) => linked.has(team.id)) };
             }
+            // A Signal without Telegram ignores the ticket: the host sends it before `ready` names
+            // the capability.
+            const telegram = this.#telegram;
+            if (message.telegramRoute && telegram) {
+              if (!tokens.verifyTelegramRoute)
+                return yield* new RemoteTokenError({ message: "Telegram route verification required." });
+              const verified = yield* tokens.verifyTelegramRoute(message.telegramRoute, claims.hostId);
+              telegramRoute = { chats: verified.chats.filter((chat) => telegram.bot.hasBot(chat.botId)) };
+              if (Date.now() < this.#validateTelegramRoutesUntil && telegramRoute.chats.length > 0) {
+                if (!tokens.validateTelegramRoute)
+                  return yield* new RemoteTokenError({ message: "Telegram route validation required." });
+                const linked = new Set(yield* tokens.validateTelegramRoute(claims.hostId, telegramRoute.chats));
+                telegramRoute = { chats: telegramRoute.chats.filter((chat) => linked.has(chat.id)) };
+              }
+            }
           }
           this.#pruneReplayCache();
           if (usedInitialTicket && this.#usedTicketIds.has(claims.jti))
             return yield* new RemoteTokenError({ message: "Ticket was already used." });
-          return { claims, slackRoute };
+          return { claims, slackRoute, telegramRoute };
         }).pipe(Effect.result);
         if (Result.isFailure(authentication)) {
           this.#metrics.authenticationFailures += 1;
@@ -526,7 +744,7 @@ export class SignalService {
         }
         // Verification may finish after disconnect removed the socket. Register nothing then.
         if (!this.#sockets.has(socket.id)) return;
-        const { claims, slackRoute } = authentication.success;
+        const { claims, slackRoute, telegramRoute } = authentication.success;
         // A reconnect of the same logical session replaces its old socket below, so that socket does not
         // count. A phone that changes network keeps a half-open socket until the idle timeout.
         const replaced =
@@ -549,6 +767,7 @@ export class SignalService {
           resumed: !usedInitialTicket,
           multiplex: message.peer === "host" && message.multiplex === true,
           slackTeams: slackRoute.teams.map((team) => slackRouteKey(team.appId, team.id)),
+          telegramChats: [],
         };
         this.#peers.set(socket.id, peer);
         this.#schedulePeerExpiration(peer);
@@ -564,12 +783,20 @@ export class SignalService {
             this.#slackRouteFloor.set(route, team.linkedAt);
             this.#slackTeams.set(route, socket.id);
           }
+          for (const chat of telegramRoute.chats) {
+            const route = telegramRouteKey(chat.botId, chat.id);
+            if (chat.linkedAt < (this.#telegramRouteFloor.get(route) ?? 0)) continue;
+            this.#telegramRouteFloor.set(route, chat.linkedAt);
+            this.#telegramChats.set(route, socket.id);
+            peer.telegramChats.push(route);
+          }
           this.#send(socket, {
             type: "ready",
             version: 1,
             connectionId: null,
             resumeToken,
             iceServers: this.#tokens.iceServers(claims),
+            ...this.#capabilities("ingress"),
           });
           return;
         }
@@ -855,4 +1082,9 @@ function randomIdentifier(): string {
 /** One Slack app in one workspace. The production and development apps can share a workspace. */
 function slackRouteKey(appId: string, teamId: string): string {
   return `${appId}:${teamId}`;
+}
+
+/** One OpenBot bot in one chat. The production and development bots can share a chat. */
+function telegramRouteKey(botId: string, chatId: string): string {
+  return `${botId}:${chatId}`;
 }

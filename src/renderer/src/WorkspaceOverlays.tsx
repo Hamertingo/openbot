@@ -16,6 +16,7 @@ import {
   type OnePasswordConnectorController,
 } from "./features/connectors/onepassword-connector";
 import { createSlackConnector } from "./features/connectors/slack-connector";
+import { createTelegramConnector } from "./features/connectors/telegram-connector";
 import { useCustomAgents } from "./features/custom-agents/custom-agents-context";
 import { useCustomProviders } from "./features/custom-providers/custom-providers-context";
 import { useProviderDetection } from "./features/custom-providers/provider-detection-context";
@@ -343,28 +344,27 @@ function ServerSettings(props: {
     setMcpServerEnabled,
     testMcpServer,
   } = useServerSettings();
-  // The Slack Orchestrator runs on this computer, so its picker lists this computer's models: none
-  // while a joined server is on screen, and then it starts on a new agent's default.
+  // The Slack and Telegram Orchestrators run on this computer, so their pickers list this computer's
+  // models: none while a joined server is on screen, and then they start on a new agent's default.
   const { collapseSidebarSection } = useSidebar();
-  const slack = createSlackConnector(
-    undefined,
-    () => {
-      const options = modelOptions();
-      if (activeServer()?.kind !== "local" || options.length === 0) return undefined;
-      return {
-        modelOptions: options,
-        agentStatus: agentStatus(),
-        initial: resolveCreationModel(serverSetupChoice() ?? setupState(), options),
-        customProviders: localEndpoints.customProviders(),
-        customAgents: localAgents.customAgents(),
-      };
-    },
-    // The Integrations section starts collapsed: the orchestrator is not an agent people chat with
-    // every day. The collapse belongs to the local server, the one on screen when Slack connects.
-    (sectionId) => {
-      if (activeServer()?.kind === "local") collapseSidebarSection(sectionId);
-    },
-  );
+  const orchestratorModels = () => {
+    const options = modelOptions();
+    if (activeServer()?.kind !== "local" || options.length === 0) return undefined;
+    return {
+      modelOptions: options,
+      agentStatus: agentStatus(),
+      initial: resolveCreationModel(serverSetupChoice() ?? setupState(), options),
+      customProviders: localEndpoints.customProviders(),
+      customAgents: localAgents.customAgents(),
+    };
+  };
+  // The Integrations section starts collapsed: the orchestrator is not an agent people chat with
+  // every day. The collapse belongs to the local server, the one on screen when the app connects.
+  const collapseOrchestratorSection = (sectionId: string) => {
+    if (activeServer()?.kind === "local") collapseSidebarSection(sectionId);
+  };
+  const slack = createSlackConnector(undefined, orchestratorModels, collapseOrchestratorSection);
+  const telegram = createTelegramConnector(undefined, orchestratorModels, collapseOrchestratorSection);
   // The workspace belongs to the selected server. For another server, the switch comes first and
   // the agent is published for the scope it lands in; a message there opens as its agent's chat.
   const openOnServer = (server: ServerSummary, agentId: string, open: () => void) => {
@@ -549,6 +549,8 @@ function ServerSettings(props: {
           // Slack is connected on the computer that runs the agents: Slack opens this computer's browser
           // and returns to its `openbot://` link.
           slackConnector={server().kind === "local" ? slack : undefined}
+          // A Telegram chat links to this computer: main opens the `t.me` link in this computer's browser.
+          telegramConnector={server().kind === "local" ? telegram : undefined}
           connectorAgents={agentList()}
         />
       )}

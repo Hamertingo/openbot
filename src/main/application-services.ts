@@ -61,8 +61,9 @@ import { BrowserHost } from "../backend/browser-host";
 import { runCauseEffect } from "../backend/effect-boundary";
 import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
-import { MessagingService } from "../backend/messaging/messaging-service";
+import { MessagingOperationFailed, MessagingService } from "../backend/messaging/messaging-service";
 import { slackDriver } from "../backend/messaging/slack/slack-driver";
+import { telegramDriver } from "../backend/messaging/telegram/telegram-driver";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
 import { StorageUsageScanner, StorageUsageService } from "../backend/storage-usage";
 import { TeamChatStore } from "../backend/team-chat-store";
@@ -308,7 +309,7 @@ export interface ApplicationServices {
   service: AgentService;
   providerRuntimes: ProviderRuntimeManager;
   providerCredentials: ProviderCredentialStore;
-  /** The Slack connections of the agents on this host. */
+  /** The Slack and Telegram connections of the agents on this host. */
   messaging: MessagingService;
   /** Reached by the entry point for one thing only: handing a returning grant to its sign-in. */
   mcpOAuth: McpOAuth;
@@ -1020,7 +1021,7 @@ export async function createApplicationServices({
   });
   teardown.push(TEARDOWN_ORDER.automation, "the automation server", () => Effect.runPromise(automation.stop()));
   /*
-   * The Slack workspaces where the agents answer. The tokens use the same cipher as every other
+   * The Slack workspaces and Telegram chats where the agents answer. The tokens use the same cipher as every other
    * secret; an unreadable file is reported, not fatal, and each workspace then connects again.
    */
   const messagingCredentials = new MessagingCredentialStore(
@@ -1054,6 +1055,10 @@ export async function createApplicationServices({
       centralAuth
         .issueSlackRoute(hostId)
         .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    issueTelegramRoute: (hostId) =>
+      centralAuth
+        .issueTelegramRoute(hostId)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
   });
   teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack ingress socket", () =>
     Effect.runPromise(slackIngress.dispose()),
@@ -1074,7 +1079,7 @@ export async function createApplicationServices({
       createMemory: (input) => service.createMemory(input),
     },
     credentials: messagingCredentials,
-    drivers: [slackDriver({ ingress: slackIngress })],
+    drivers: [slackDriver({ ingress: slackIngress }), telegramDriver({ ingress: slackIngress })],
     downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
     ingress: slackIngress,
     sidebar: sidebarLayout,
@@ -1111,6 +1116,31 @@ export async function createApplicationServices({
             ? centralAuth
                 .unlinkSlackWorkspace(hostId, workspaceId)
                 .pipe(Effect.mapError((error) => new SlackConnectFailed({ cause: error.cause })))
+            : Effect.void;
+        }),
+      openExternal: (url) => shell.openExternal(url),
+    },
+    telegramApp: {
+      createLink: () =>
+        Effect.suspend(() => {
+          const hostId = slackIngressHostId();
+          if (!hostId)
+            return Effect.fail(
+              new MessagingOperationFailed({
+                cause: new Error(sourceText("error.messaging.telegramRelayUnavailable")),
+              }),
+            );
+          return centralAuth
+            .createTelegramLink(hostId)
+            .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
+        }),
+      unlink: (chatId) =>
+        Effect.suspend(() => {
+          const hostId = slackIngressHostId();
+          return hostId
+            ? centralAuth
+                .unlinkTelegramChat(hostId, chatId)
+                .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
             : Effect.void;
         }),
       openExternal: (url) => shell.openExternal(url),

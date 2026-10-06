@@ -201,7 +201,14 @@ const onlineIngress: MessagingIngress = {
   state: () => "online",
   onState: () => () => undefined,
   handle: () => undefined,
+  handleTelegram: () => undefined,
   reconnect: () => undefined,
+  telegram: {
+    available: () => false,
+    call: () => Effect.die("Slack tests make no Telegram call."),
+    download: () => Effect.die("Slack tests make no Telegram call."),
+    upload: () => Effect.die("Slack tests make no Telegram call."),
+  },
 };
 
 class MemoryCredentials implements MessagingCredentials {
@@ -439,7 +446,7 @@ describe.sequential("Slack messaging end to end", () => {
   it("stops on a token Slack no longer accepts, and keeps the workspace when an agent is deleted", async () => {
     const { agent, credentials } = await connected();
     slack.rejectBotToken = true;
-    await runCauseEffect(messaging?.reconnect("T1") ?? Effect.succeed(undefined));
+    await runCauseEffect(messaging?.reconnect("slack", "T1") ?? Effect.succeed(undefined));
     await waitFor(() => workspace()?.state === "invalid_token");
     slack.rejectBotToken = false;
 

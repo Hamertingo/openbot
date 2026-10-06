@@ -7,6 +7,7 @@ import {
   type IntegrationStatus,
   OnePasswordMark,
   SlackMark,
+  TelegramMark,
 } from "@openbot/ui/features/settings/IntegrationLayout";
 import { IntegrationsHub, type IntegrationsHubRow } from "@openbot/ui/features/settings/IntegrationsHub";
 import { OnePasswordConnectorPanel } from "@openbot/ui/features/settings/OnePasswordConnectorPanel";
@@ -15,13 +16,19 @@ import {
   slackIntegrationState,
   slackOrchestrator,
 } from "@openbot/ui/features/settings/SlackIntegrationPanel";
+import {
+  TelegramIntegrationPanel,
+  telegramIntegrationState,
+  telegramOrchestrator,
+} from "@openbot/ui/features/settings/TelegramIntegrationPanel";
 import { useText } from "@openbot/ui/text";
 import { createSignal, Match, onSettled, Show, Switch } from "solid-js";
 import { type GitHubConnectorController, githubPanelProps } from "./github-connector";
 import { type OnePasswordConnectorController, onePasswordPanelProps } from "./onepassword-connector";
 import type { SlackConnectorController } from "./slack-connector";
+import type { TelegramConnectorController } from "./telegram-connector";
 
-type View = "hub" | "github" | "onepassword" | "slack";
+type View = "hub" | "github" | "onepassword" | "slack" | "telegram";
 
 const GITHUB_STATUS = {
   disconnected: { status: "idle", label: "connector.github.statusNotSetUp" },
@@ -45,12 +52,21 @@ export function ConnectorsPanel(props: {
   github?: GitHubConnectorController | undefined;
   onePassword?: OnePasswordConnectorController | undefined;
   slack?: SlackConnectorController | undefined;
+  telegram?: TelegramConnectorController | undefined;
   agents: AgentProfile[];
 }) {
   const { t } = useText();
   const [view, setView] = createSignal<View>("hub");
-  // The Slack state changes on its own and main sends no event, so it is read while the section shows.
-  onSettled(() => props.slack?.watch());
+  // The Slack and Telegram states change on their own and main sends no event, so they are read
+  // while the section shows.
+  onSettled(() => {
+    const stopSlack = props.slack?.watch();
+    const stopTelegram = props.telegram?.watch();
+    return () => {
+      stopSlack?.();
+      stopTelegram?.();
+    };
+  });
 
   const githubRow = (github: GitHubConnectorController): IntegrationsHubRow => {
     const status = github.status();
@@ -110,9 +126,33 @@ export function ConnectorsPanel(props: {
       onOpen: () => setView("slack"),
     };
   };
+  const telegramRow = (telegram: TelegramConnectorController): IntegrationsHubRow => {
+    const connections = telegram.overview()?.connections ?? [];
+    const state = telegramIntegrationState(connections, props.agents);
+    const orchestrator = telegramOrchestrator(connections, props.agents);
+    const count = connections.length;
+    return {
+      id: "telegram",
+      name: t("connector.telegram.title"),
+      logo: <TelegramMark />,
+      status: state.status,
+      statusLabel: t(state.label),
+      summary:
+        state.attention > 0
+          ? t("connector.telegram.attentionTitle", { count: state.attention })
+          : count === 0
+            ? t("connector.telegram.description")
+            : orchestrator
+              ? t("connector.telegram.summaryConnected", { count })
+              : t("connector.telegram.summaryNoAgent", { count }),
+      agents: orchestrator ? [orchestrator] : [],
+      onOpen: () => setView("telegram"),
+    };
+  };
   const rows = () => {
     const list: IntegrationsHubRow[] = [];
     if (props.slack) list.push(slackRow(props.slack));
+    if (props.telegram) list.push(telegramRow(props.telegram));
     if (props.github) list.push(githubRow(props.github));
     if (props.onePassword) list.push(onePasswordRow(props.onePassword));
     return list;
@@ -159,6 +199,28 @@ export function ConnectorsPanel(props: {
                   onReconnect={slack().reconnect}
                   onSetEnabled={slack().setEnabled}
                   onAddOrchestrator={slack().addOrchestrator}
+                />
+              )}
+            </Show>
+          </div>
+        )}
+      </Match>
+      <Match when={view() === "telegram" && props.telegram}>
+        {(telegram) => (
+          <div class="integrations-hub">
+            <Back />
+            <Show when={telegram().overview()}>
+              {(overview) => (
+                <TelegramIntegrationPanel
+                  agents={props.agents}
+                  connections={overview().connections}
+                  busy={telegram().busy()}
+                  models={telegram().models()}
+                  onConnectChat={telegram().connectChat}
+                  onDisconnectChat={telegram().disconnectChat}
+                  onReconnect={telegram().reconnect}
+                  onSetEnabled={telegram().setEnabled}
+                  onAddOrchestrator={telegram().addOrchestrator}
                 />
               )}
             </Show>

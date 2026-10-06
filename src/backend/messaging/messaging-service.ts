@@ -4,19 +4,23 @@ import { basename, join } from "node:path";
 import { ATTACHMENT_LIMITS, INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AddSlackOrchestratorInput,
+  AddTelegramOrchestratorInput,
   AgentApproval,
   AgentEvent,
   AgentSummary,
+  ConnectTelegramChatInput,
   MessagingConnection,
   MessagingConnectionState,
   MessagingCredentialState,
   MessagingPlatform,
   RespondToApprovalInput,
   SlackOverview,
+  TelegramOverview,
 } from "@openbot/contracts/ipc";
 import { MESSAGING_CONNECTION_STATES } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { SLACK_ORCHESTRATOR_AVATAR } from "@openbot/contracts/slack-app";
+import { TELEGRAM_ORCHESTRATOR_AVATAR } from "@openbot/contracts/telegram-app";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText } from "@openbot/logging";
 import { Deferred, Effect, Exit, Result, Schema, Scope } from "effect";
@@ -41,6 +45,9 @@ import {
 import { type SlackAppPort, SlackConnect } from "./slack/slack-connect";
 import { slackOrchestratorMemories, slackOrchestratorProfile } from "./slack/slack-orchestrator";
 import { SlackWebApi } from "./slack/slack-web-api";
+import { type TelegramAppPort, telegramLinkUrl } from "./telegram/telegram-connect";
+import { telegramOrchestratorMemories, telegramOrchestratorProfile } from "./telegram/telegram-orchestrator";
+import { parseTelegramUpdate, telegramLink } from "./telegram/telegram-updates";
 
 const logger = createOpenBotLogger("messaging");
 
@@ -84,6 +91,8 @@ export interface MessagingServiceOptions {
   slackApp?: SlackAppPort;
   /** Only tests change this. */
   slackOrigin?: string;
+  /** The account service half of the OpenBot Telegram bot. Without it and `ingress`, no chat can connect. */
+  telegramApp?: TelegramAppPort;
   /** Where the Slack Orchestrator goes in the sidebar: an Integrations section. */
   sidebar?: Pick<SidebarLayoutStore, "getSnapshot" | "mutate">;
 }
@@ -117,7 +126,7 @@ interface PendingApproval {
   answered: boolean;
 }
 
-const FATAL_STATES = new Set<MessagingConnectionState>(["invalid_token"]);
+const FATAL_STATES = new Set<MessagingConnectionState>(["invalid_token", "removed"]);
 const LIVE_STATES = new Set<MessagingConnectionState>(["connecting", "connected", "reconnecting", "rate_limited"]);
 const APPROVAL_TEXT_LIMIT = 2_500;
 const CANCEL_TEXT = /^(cancel|stop)$/i;
@@ -153,6 +162,7 @@ export class MessagingService {
   readonly #ingress: MessagingIngress | null;
   readonly #connect: SlackConnect | null;
   readonly #slackOrigin: string | undefined;
+  readonly #telegramApp: TelegramAppPort | null;
   readonly #sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "mutate"> | null;
   #started = false;
   #scope = Scope.makeUnsafe();
@@ -166,6 +176,7 @@ export class MessagingService {
     this.#ingress = options.ingress ?? null;
     this.#connect = options.ingress && options.slackApp ? new SlackConnect(options.slackApp) : null;
     this.#slackOrigin = options.slackOrigin;
+    this.#telegramApp = options.ingress && options.telegramApp ? options.telegramApp : null;
     this.#sidebar = options.sidebar ?? null;
   }
 
@@ -183,6 +194,7 @@ export class MessagingService {
     );
     this.#threads.setContextSource((link, origin) => this.#promptContext(link, origin));
     this.#ingress?.handle((workspaceId, delivery) => this.deliverSlack(workspaceId, delivery));
+    this.#ingress?.handleTelegram((botId, chatId, body) => this.deliverTelegram(botId, chatId, body));
     const records = this.#threads.store.connections();
     yield* this.#credentials.retain(new Set(records.map((record) => record.connectionId)));
     yield* Effect.forEach(
@@ -199,6 +211,7 @@ export class MessagingService {
     for (const unsubscribe of this.#unsubscribe.splice(0)) unsubscribe();
     this.#threads.setContextSource(null);
     this.#ingress?.handle(null);
+    this.#ingress?.handleTelegram(null);
     yield* Effect.forEach(
       [...this.#live.values()],
       (live) => {
@@ -223,19 +236,32 @@ export class MessagingService {
 
   /** The Slack workspaces of this computer, for Server settings > Connectors. A disconnected one is left out. */
   slackOverview(): SlackOverview {
-    return {
-      connections: this.#threads.store
-        .connections()
-        .filter((record) => record.platform === "slack" && this.#credentials.status(record.connectionId) !== "missing")
-        .map((record) => this.#summary(record)),
-    };
+    return { connections: this.#overview("slack") };
+  }
+
+  /** The Telegram chats linked to this computer. A disconnected one is left out. */
+  telegramOverview(): TelegramOverview {
+    return { connections: this.#overview("telegram") };
+  }
+
+  #overview(platform: MessagingPlatform): MessagingConnection[] {
+    return this.#threads.store
+      .connections()
+      .filter((record) => record.platform === platform && this.#credentials.status(record.connectionId) !== "missing")
+      .map((record) => this.#summary(record));
   }
 
   readonly reconnect = Effect.fn("MessagingService.reconnect")(function* (
     this: MessagingService,
+    platform: MessagingPlatform,
     workspaceId: string,
   ): Effect.fn.Return<void, MessagingOperationFailed> {
-    const record = this.#requireConnection(workspaceId);
+    const record = yield* messagingStep(() => this.#requireConnection(platform, workspaceId));
+    // The bot left the chat, and the chat is unlinked: only a new link brings it back.
+    if (record.lastErrorCode === "removed")
+      return yield* new MessagingOperationFailed({
+        cause: new Error(sourceText("error.messaging.telegramNotConnected")),
+      });
     yield* this.#stopConnection(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, { enabled: true, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
@@ -245,10 +271,11 @@ export class MessagingService {
 
   readonly setEnabled = Effect.fn("MessagingService.setEnabled")(function* (
     this: MessagingService,
+    platform: MessagingPlatform,
     workspaceId: string,
     enabled: boolean,
   ): Effect.fn.Return<void, MessagingOperationFailed> {
-    const record = this.#requireConnection(workspaceId);
+    const record = yield* messagingStep(() => this.#requireConnection(platform, workspaceId));
     yield* this.#stopConnection(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, { enabled, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
@@ -259,7 +286,7 @@ export class MessagingService {
     this: MessagingService,
     input: AddSlackOrchestratorInput,
   ) {
-    const record = yield* messagingStep(() => this.#requireConnection(input.workspaceId));
+    const record = yield* messagingStep(() => this.#requireConnection("slack", input.workspaceId));
     const current = this.#agents.listAgents().find((agent) => agent.id === record.orchestratorAgentId);
     if (current) return { agentId: current.id, sectionId: null };
     const agent = yield* this.#agents
@@ -350,7 +377,7 @@ export class MessagingService {
     this: MessagingService,
     workspaceId: string,
   ) {
-    const record = yield* messagingStep(() => this.#requireConnection(workspaceId));
+    const record = yield* messagingStep(() => this.#requireConnection("slack", workspaceId));
     yield* this.#stopConnection(record.connectionId);
     const botToken = this.#credentials.get(record.connectionId)?.botToken;
     if (botToken)
@@ -385,6 +412,154 @@ export class MessagingService {
     return yield* transport.deliver(delivery);
   }).bind(this);
 
+  /**
+   * Creates the Telegram Orchestrator, or gives the one that exists to every Telegram chat. One agent
+   * answers every chat, so a chat linked later gets it too.
+   */
+  readonly addTelegramOrchestrator = Effect.fn("MessagingService.addTelegramOrchestrator")(function* (
+    this: MessagingService,
+    input: AddTelegramOrchestratorInput,
+  ) {
+    const records = this.#threads.store.connections().filter((record) => record.platform === "telegram");
+    if (!records.length)
+      return yield* new MessagingOperationFailed({
+        cause: new Error(sourceText("error.messaging.telegramNotConnected")),
+      });
+    const current = this.#telegramOrchestrator();
+    if (current) {
+      this.#assignTelegramOrchestrator(current);
+      return { agentId: current, sectionId: null };
+    }
+    const agent = yield* this.#agents
+      .createAgentProfile({
+        ...telegramOrchestratorProfile(),
+        ...TELEGRAM_ORCHESTRATOR_AVATAR,
+        ...(input.provider ? { provider: input.provider } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      })
+      .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
+    for (const text of telegramOrchestratorMemories()) this.#agents.createMemory({ agentId: agent.id, text });
+    this.#assignTelegramOrchestrator(agent.id);
+    const sectionId = yield* this.#placeInIntegrations(agent.id).pipe(
+      Effect.catch((failure) => {
+        this.#warn(failure.cause);
+        return Effect.succeed(null);
+      }),
+    );
+    return { agentId: agent.id, sectionId };
+  }, Effect.uninterruptible).bind(this);
+
+  /**
+   * Opens a `t.me` link with a one-use code in the browser. Telegram sends the code in the chat that
+   * the user adds the bot to, and Signal links that chat to this host (`deliverTelegram`).
+   */
+  readonly connectTelegramChat = Effect.fn("MessagingService.connectTelegramChat")(function* (
+    this: MessagingService,
+    place: ConnectTelegramChatInput["place"],
+  ) {
+    const { app } = yield* messagingStep(() => this.#requireTelegram());
+    const link = yield* app.createLink();
+    yield* messagingIo(() => app.openExternal(telegramLinkUrl(link.botUsername, link.code, place)));
+  }).bind(this);
+
+  /**
+   * The bot leaves the chat, and the chat is unlinked from this host. The conversations stay in
+   * OpenBot, and a later link of the same chat gives them back their agents.
+   */
+  readonly disconnectTelegramChat = Effect.fn("MessagingService.disconnectTelegramChat")(function* (
+    this: MessagingService,
+    chatId: string,
+  ) {
+    const { app, ingress } = yield* messagingStep(() => this.#requireTelegram());
+    const record = yield* messagingStep(() => this.#requireConnection("telegram", chatId));
+    yield* this.#stopConnection(record.connectionId);
+    const botId = this.#credentials.get(record.connectionId)?.botId;
+    // Before the unlink: Signal accepts a call only for a chat that is routed to this host.
+    if (botId && ingress.telegram.available())
+      yield* ingress.telegram
+        .call(botId, "leaveChat", { chat_id: Number(chatId) })
+        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+    yield* this.#credentials.clear(record.connectionId);
+    yield* messagingStep(() =>
+      this.#threads.store.updateConnection(record.connectionId, { enabled: false, lastErrorCode: null }),
+    );
+    yield* app.unlink(chatId).pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+  }, Effect.uninterruptible).bind(this);
+
+  /**
+   * One Telegram update of a chat routed to this host, which Signal has checked. A `/start <code>`
+   * links the chat: Signal and the account service have already matched the code to this host.
+   */
+  readonly deliverTelegram = Effect.fn("MessagingService.deliverTelegram")(function* (
+    this: MessagingService,
+    botId: string,
+    chatId: string,
+    body: Uint8Array,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
+    const update = parseTelegramUpdate(body);
+    if (!update) return;
+    const link = telegramLink(update);
+    if (link) return yield* this.#linkTelegramChat(botId, chatId, link.title);
+    const record = this.#threads.store.connectionForWorkspace("telegram", chatId);
+    // A chat that both the production and the development bot are in answers only its own bot.
+    if (!record?.enabled || (record.appId && record.appId !== botId)) return;
+    const transport = this.#live.get(record.connectionId)?.transport;
+    if (transport?.deliver) yield* transport.deliver({ kind: "telegram", retryNum: null, body });
+  }).bind(this);
+
+  readonly #linkTelegramChat = Effect.fn("MessagingService.linkTelegramChat")(function* (
+    this: MessagingService,
+    botId: string,
+    chatId: string,
+    title: string,
+  ) {
+    const { ingress } = yield* messagingStep(() => this.#requireTelegram());
+    const record = yield* messagingStep(() => this.#threads.store.ensureConnection("telegram", chatId, title));
+    yield* this.#stopConnection(record.connectionId);
+    const me = yield* ingress.telegram.call(botId, "getMe", {}).pipe(Effect.catch(() => Effect.succeed({})));
+    const botUsername = "username" in me && me.username ? me.username : "";
+    yield* this.#credentials.set(record.connectionId, {
+      botId,
+      chatId,
+      chatTitle: title,
+      ...(botUsername ? { botUsername } : {}),
+    });
+    this.#threads.store.updateConnection(record.connectionId, {
+      enabled: true,
+      workspaceName: title,
+      botUserId: botId,
+      appId: botId,
+      lastErrorCode: null,
+      orchestratorAgentId: this.#orchestrator(record) ?? this.#telegramOrchestrator(),
+    });
+    const updated = this.#threads.store.connection(record.connectionId);
+    if (updated) yield* this.#startConnection(updated);
+    const live = this.#live.get(record.connectionId);
+    if (live)
+      yield* live.adapter
+        .post(
+          { platformChannelId: chatId, replyThreadId: null },
+          { text: sourceText("status.messaging.telegramLinked", { bot: botUsername ? `@${botUsername}` : "OpenBot" }) },
+        )
+        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+  }, Effect.uninterruptible);
+
+  /** The Telegram Orchestrator: one agent for every Telegram chat, or null until the user adds it. */
+  #telegramOrchestrator(): string | null {
+    const agents = new Set(this.#agents.listAgents().map((agent) => agent.id));
+    for (const record of this.#threads.store.connections())
+      if (record.platform === "telegram" && record.orchestratorAgentId && agents.has(record.orchestratorAgentId))
+        return record.orchestratorAgentId;
+    return null;
+  }
+
+  #assignTelegramOrchestrator(agentId: string): void {
+    for (const record of this.#threads.store.connections())
+      if (record.platform === "telegram" && record.orchestratorAgentId !== agentId)
+        this.#threads.store.updateConnection(record.connectionId, { orchestratorAgentId: agentId });
+  }
+
   // Connection lifecycle.
 
   readonly #startConnection = Effect.fn("MessagingService.startConnection")(function* (
@@ -393,7 +568,7 @@ export class MessagingService {
   ) {
     const credentials = this.#credentials.get(record.connectionId);
     const driver = this.#drivers.get(record.platform);
-    if (!credentials?.botToken || !driver) return;
+    if (!driver || !credentials?.[driver.credentialKey]) return;
     const live: LiveConnection = {
       record,
       adapter: driver.createAdapter(credentials, {
@@ -445,6 +620,7 @@ export class MessagingService {
       },
       message: (message) => this.#dispatch(this.#receive(live, message)),
       action: (action) => this.#dispatch(this.#action(live, action)),
+      renamed: (workspaceName) => this.#dispatch(this.#renamed(live, workspaceName)),
       placeCreated: (platformChannelId) => {
         const join = live.adapter.joinPlace?.(platformChannelId);
         if (join)
@@ -460,6 +636,19 @@ export class MessagingService {
         this.#scope,
         { startImmediately: true },
       );
+  });
+
+  /** The chat has a new title. The credentials keep it too, so the next start does not take the old one. */
+  readonly #renamed = Effect.fn("MessagingService.renamed")(function* (
+    this: MessagingService,
+    live: LiveConnection,
+    workspaceName: string,
+  ) {
+    const name = workspaceName.slice(0, 256);
+    this.#threads.store.updateConnection(live.record.connectionId, { workspaceName: name });
+    const values = this.#credentials.get(live.record.connectionId);
+    if (values?.chatTitle !== undefined)
+      yield* this.#credentials.set(live.record.connectionId, { ...values, chatTitle: name });
   });
 
   readonly #restart = Effect.fn("MessagingService.restart")(function* (
@@ -490,11 +679,15 @@ export class MessagingService {
     if (FATAL_STATES.has(state)) {
       this.#threads.store.updateConnection(live.record.connectionId, { lastErrorCode: state });
       logger.warn("A messaging connection stopped.", { platform: live.record.platform, state });
-      // The workspace uninstalled OpenBot or revoked its token: Signal stops routing it here.
-      if (this.#connect)
-        yield* this.#connect
-          .unlink(live.record.workspaceId)
-          .pipe(Effect.catch((error) => Effect.sync(() => this.#warn(error.cause))));
+      // The workspace uninstalled OpenBot or revoked its token, or the bot left the Telegram chat:
+      // Signal stops routing it here.
+      const unlink =
+        live.record.platform === "telegram"
+          ? this.#telegramApp?.unlink(live.record.workspaceId)
+          : this.#connect
+              ?.unlink(live.record.workspaceId)
+              .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
+      if (unlink) yield* unlink.pipe(Effect.catch((error) => Effect.sync(() => this.#warn(error.cause))));
     }
   });
 
@@ -502,10 +695,11 @@ export class MessagingService {
     const live = this.#live.get(record.connectionId);
     const credentials = this.#credentials.status(record.connectionId);
     const values = credentials === "saved" ? this.#credentials.get(record.connectionId) : null;
+    const credentialKey = this.#drivers.get(record.platform)?.credentialKey ?? "botToken";
     const stored = isOneOf(MESSAGING_CONNECTION_STATES, record.lastErrorCode) ? record.lastErrorCode : null;
     const state: MessagingConnectionState = !record.enabled
       ? "paused"
-      : credentials === "unreadable" || (values && !values.botToken)
+      : credentials === "unreadable" || (values && !values[credentialKey])
         ? "secret_storage_unavailable"
         : (live?.state ?? stored ?? "connecting");
     return {
@@ -567,7 +761,11 @@ export class MessagingService {
     const agentId = existing?.agentId ?? this.#orchestrator(live.record);
     if (!agentId) {
       yield* adapter
-        .post(message.target, { text: sourceText("status.messaging.noAgent") })
+        .post(message.target, {
+          text: sourceText(
+            live.record.platform === "telegram" ? "status.messaging.telegramNoAgent" : "status.messaging.noAgent",
+          ),
+        })
         .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
       return;
     }
@@ -982,10 +1180,18 @@ export class MessagingService {
     );
   });
 
-  #requireConnection(workspaceId: string): MessagingConnectionRecord {
-    const record = this.#threads.store.connectionForWorkspace("slack", workspaceId);
-    if (!record) throw new Error(sourceText("error.messaging.notConnected"));
+  #requireConnection(platform: MessagingPlatform, workspaceId: string): MessagingConnectionRecord {
+    const record = this.#threads.store.connectionForWorkspace(platform, workspaceId);
+    if (!record)
+      throw new Error(
+        sourceText(platform === "telegram" ? "error.messaging.telegramNotConnected" : "error.messaging.notConnected"),
+      );
     return record;
+  }
+
+  #requireTelegram(): { app: TelegramAppPort; ingress: MessagingIngress } {
+    if (!this.#telegramApp || !this.#ingress) throw new Error(sourceText("error.messaging.telegramUnsupported"));
+    return { app: this.#telegramApp, ingress: this.#ingress };
   }
 
   #requireConnect(): SlackConnect {

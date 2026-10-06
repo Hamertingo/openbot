@@ -7,4 +7,8 @@ export const messages = {
   "error.messaging.unsupported": "Bu bilgisayar Slack'e bağlanamıyor.",
   "error.messaging.relayUnavailable":
     "OpenBot bu bilgisayarda Slack etkinliklerini alamıyor. Oturum açın, bu bilgisayara bir ad verin ve tekrar deneyin.",
+  "error.messaging.telegramNotConnected": "Bu Telegram sohbeti bağlı değil.",
+  "error.messaging.telegramUnsupported": "Bu bilgisayar Telegram'a bağlanamıyor.",
+  "error.messaging.telegramRelayUnavailable":
+    "OpenBot bu bilgisayarda Telegram'a ulaşamıyor. Oturum açın, bu bilgisayara bir ad verin ve tekrar deneyin.",
 } as const satisfies PartialTranslation<typeof source>;

@@ -1,6 +1,12 @@
 // The messaging payloads. No message here quotes the input.
 
-import type { AddSlackOrchestratorInput, SetSlackEnabledInput, SlackWorkspaceInput } from "@openbot/contracts/ipc";
+import type {
+  AddSlackOrchestratorInput,
+  AddTelegramOrchestratorInput,
+  ConnectTelegramChatInput,
+  SetSlackEnabledInput,
+  SlackWorkspaceInput,
+} from "@openbot/contracts/ipc";
 import { isAgentModel, isAgentProvider, isReasoningEffort } from "@openbot/contracts/ipc";
 import { isBoolean } from "@openbot/contracts/runtime-values";
 import { isObject, requireString } from "./validation";
@@ -15,9 +21,20 @@ export function parseSetSlackEnabledInput(value: unknown): SetSlackEnabledInput 
   return { workspaceId: requireString(value.workspaceId, "Workspace id"), enabled: value.enabled };
 }
 
+export function parseConnectTelegramChatInput(value: unknown): ConnectTelegramChatInput {
+  if (!isObject(value) || (value.place !== "group" && value.place !== "direct"))
+    throw new Error("A messaging request is invalid.");
+  return { place: value.place };
+}
+
 export function parseAddSlackOrchestratorInput(value: unknown): AddSlackOrchestratorInput {
   if (!isObject(value)) throw new Error("A messaging request is invalid.");
-  const result: AddSlackOrchestratorInput = { workspaceId: requireString(value.workspaceId, "Workspace id") };
+  return { workspaceId: requireString(value.workspaceId, "Workspace id"), ...parseAddTelegramOrchestratorInput(value) };
+}
+
+export function parseAddTelegramOrchestratorInput(value: unknown): AddTelegramOrchestratorInput {
+  if (!isObject(value)) throw new Error("A messaging request is invalid.");
+  const result: AddTelegramOrchestratorInput = {};
   if (value.provider !== undefined) {
     if (!isAgentProvider(value.provider)) throw new Error("A messaging request is invalid.");
     result.provider = value.provider;

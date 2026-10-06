@@ -1,8 +1,8 @@
 # Messaging connections
 
-The agents of this computer can answer in an external chat platform. Slack is supported today. The
-design notes are in [ARCHITECTURE.md](ARCHITECTURE.md#messaging-connections), and the launch steps
-in [apps/slack-app/LAUNCH.md](../apps/slack-app/LAUNCH.md).
+The agents of this computer can answer in an external chat platform: Slack and Telegram. The
+design notes are in [ARCHITECTURE.md](ARCHITECTURE.md#messaging-connections), and the Slack launch
+steps in [apps/slack-app/LAUNCH.md](../apps/slack-app/LAUNCH.md).
 
 ## Connect Slack
 
@@ -49,6 +49,53 @@ browser. A joined server shows no Slack page.
   message can answer it there. The OpenBot host can always answer it.
 - `stop` or `cancel` in the thread, or the **Stop** button, stops the request of the person who
   sends it.
+
+## Connect Telegram
+
+One OpenBot bot serves every user. People mention it in a group, or reply to its messages, and the
+Telegram Orchestrator, an agent that OpenBot adds, asks the right agent and answers. This needs an
+OpenBot account and a name for this computer (**Server settings**), because Telegram sends the
+updates to OpenBot's Signal service, which passes them to this computer. Signal holds the bot token;
+this computer never has it.
+
+1. Open **Server settings → Connectors → Telegram**.
+2. Select **Add to a group** or **Open a direct chat**. Telegram opens with a one-use link (it is
+   valid for 15 minutes). Pick the group, or select **Start**. The chat appears in OpenBot by itself.
+3. Pick the model of the Telegram Orchestrator, and select **Add agent**. One orchestrator answers
+   every Telegram chat. It goes in the **Integrations** section of the sidebar.
+4. In the group, mention the bot (`@<bot> …`), or reply to one of its messages.
+
+A chat answers to one OpenBot server. Another account cannot link a chat that your server answers
+until you disconnect it. **Disconnect** makes the bot leave the chat and unlinks it; the
+conversations stay in OpenBot, and a later link of the same chat gives them back their agents.
+
+## What happens in Telegram
+
+- A mention starts, or continues, the conversation of its reply chain. In a supergroup, Telegram
+  gives each reply chain its own thread, so a reply to the bot, or to a message in the chain, reaches
+  the same agent without a mention. In a forum, each topic is one conversation. A direct chat is one
+  conversation.
+- With privacy mode on (Telegram's default), Telegram sends the bot only messages that mention it,
+  replies to it and commands. Other messages of the chat do not reach this computer.
+- 👀 means the message arrived. "Working on it…" is replaced by the answer. 👌, 💔 or 🫡 shows the end.
+- An approval appears with **Approve** and **Deny**. Only the person who wrote the message can answer
+  it there. When another person presses a button, the bot answers in the chat that only the requester
+  can do it.
+- `@<bot> stop` or a reply `stop` to the bot, or the **Stop** button, stops the request.
+- Files up to 20 MB go both ways.
+
+## Test Telegram locally
+
+Telegram must reach Signal over public HTTPS.
+
+1. Make a development bot with [@BotFather](https://t.me/BotFather). Keep privacy mode on.
+2. Start a tunnel to the local Signal, for example `cloudflared tunnel --url http://127.0.0.1:<signal port>`.
+3. Give Signal `TELEGRAM_BOT_TOKENS` (the bot token), `TELEGRAM_WEBHOOK_SECRET` (32 bytes or more) and
+   `TELEGRAM_WEBHOOK_ORIGIN` (the tunnel address). Signal sets the bot's webhook when it starts.
+4. In `apps/auth-api/.env.dev`, set `TELEGRAM_BOT_ID` (the part of the token before `:`),
+   `TELEGRAM_BOT_USERNAME`, and the Slack route key (see below): it signs the Telegram route ticket too.
+
+Not confirmed: this flow end to end against Telegram. The tests use a fake Signal and a fake Bot API.
 
 ## Test Slack locally
 
@@ -107,6 +154,14 @@ The workspace row says what is wrong.
   back to that conversation. The agent then posts its answer in the same thread, and the original
   message keeps its reactions.
 - A question the agent asks is answered on the host. Slack shows nothing for it.
+- Telegram does not send an update again. An update that arrives while this computer is off, or
+  while it cannot reach Signal, is lost.
+- In a basic Telegram group (not a supergroup), OpenBot finds the reply chain in memory. After a
+  restart, a reply to an older message starts a new conversation.
+- When a Telegram group becomes a supergroup, it gets a new ID. OpenBot shows the chat as removed:
+  disconnect it, and add the bot again.
+- Telegram has no history API. The agent sees as context only the messages that this computer saw
+  since it started, and the message that a request answers.
 
 ## Adding a platform
 
@@ -122,7 +177,7 @@ core changes:
 | --- | --- | --- | --- |
 | Slack | The Events API through Signal | `thread_ts`, or the message `ts` that starts a thread | Implemented. |
 | Discord | Gateway WebSocket (`@discordjs/ws` style: heartbeat, resume) | The thread channel id, or the message id that starts a thread | Needs the Message Content intent. Reactions map directly. |
-| Telegram | Long polling with `getUpdates` and an offset | `message_thread_id` in a forum, else the chat id | No history API: store what the bot sees for context. |
+| Telegram | The webhook of the one OpenBot bot through Signal, which holds the token | `message_thread_id`, the topic in a forum, `dm` in a direct chat | Implemented. No history API: the host keeps what the bot sees, in memory. |
 
 Then add the platform to `MESSAGING_PLATFORMS`, a page in Server settings → Connectors, and its i18n
 keys. The database needs no migration: `platform` has no `CHECK`.

@@ -326,7 +326,8 @@ Cloudflare processes account and configuration API requests. It does not carry T
 message, command, Remote Desktop media, or Remote Desktop input traffic. It forwards sealed iPhone
 Live Activity updates that it cannot read; see [iPhone Live Activity](#iphone-live-activity). For an
 agent's Slack app, it exchanges the Slack sign-in and serves the install page; see
-[Slack connections](#slack-connections). Cloudflare and the email provider can keep their own
+[Slack connections](#slack-connections). For the OpenBot Telegram bot, it records which computer
+answers each chat; see [Telegram connections](#telegram-connections). Cloudflare and the email provider can keep their own
 security, delivery, and network logs under their own policies. These provider logs are outside the
 OpenBot application database and its daily maintenance task.
 
@@ -403,8 +404,9 @@ media connection. ICE uses a direct peer-to-peer path when possible. If a direct
 Agents, conversations, queues, direct messages, attachments, browser data, prompts, approvals, and
 Remote Desktop data remain on the host. The central account service does not copy them into D1 or
 R2. The Signal service does not proxy them or write them to logs. The host does not need a public
-inbound port. The one thing Signal passes to a host is the Slack events of an agent's Slack app, in
-transit; see [Slack connections](#slack-connections).
+inbound port. The one thing Signal passes to a host is the Slack events of an agent's Slack app, and
+the updates and Bot API calls of the OpenBot Telegram bot, in transit; see
+[Slack connections](#slack-connections) and [Telegram connections](#telegram-connections).
 
 An owner or admin of a joined server can manage its host from their own computer, or from the
 browser client at `/app`. A provider API key, a custom endpoint key or header, the code that a
@@ -458,7 +460,8 @@ Network traffic can also occur when:
   versions from `raw.githubusercontent.com/nightly-labs/openbot`. These requests contain no account, agent,
   conversation or file data;
 - a user opens an explicitly labeled external support or setup link;
-- a Slack workspace is connected. See [Slack connections](#slack-connections).
+- a Slack workspace is connected. See [Slack connections](#slack-connections);
+- a Telegram chat is connected. See [Telegram connections](#telegram-connections).
 
 ## Slack connections
 
@@ -497,6 +500,48 @@ answers go from the computer to the Slack Web API directly.
 Anyone who can post in the Slack workspace, guests and Slack Connect members included, can give the
 agents work. The agents run on the host with the access the user gave them. A hosted server stays awake
 while a Slack connection is live.
+
+## Telegram connections
+
+One OpenBot Telegram bot serves every user. Its token is only in OpenBot's Signal service
+(`signal.openbot.run`); no computer has it. The user connects a chat from OpenBot on their computer:
+the account service gives a one-use code, and the browser opens a `t.me` link with it. When the user
+adds the bot to a group, or starts a direct chat with it, Telegram sends the code in that chat.
+Signal then asks the account service to link the chat to the computer. The account service records
+the Telegram chat ID, the bot ID, the computer, the OpenBot account and the time of the link, and a
+hash of each code until it is used or expires. It keeps no chat name and no message.
+
+Telegram sends each update of a linked chat, which contains the messages that mention the bot or reply
+to it, the messages of a direct chat, and button presses, to Signal. Signal checks Telegram's secret
+header and reads only the chat ID, a link code and the ID of a button press, to find the computer. It
+passes each update to that computer over its Signal connection, in transit only: it does not store or
+log it. The computer's answers, status posts, reactions and files go to Telegram through Signal,
+because only Signal has the token. Signal accepts only a fixed list of Bot API calls, only for the
+chats linked to that computer, and returns only message IDs to it. Files go through Signal with
+short-lived signed addresses, in transit only.
+
+- **Stored on the host.** The bot ID, the bot username, the chat ID and the chat name are encrypted
+  by the operating system's secret storage and redacted from logs, exports and diagnostics. The
+  database holds the chat name and IDs, which agent is the Telegram Orchestrator, and one row per
+  conversation that an agent answers. The messages of that conversation are kept as a conversation
+  of that agent, with the Telegram name of each author, and files people send are kept with the
+  agent's attachments. The names of authors and the last messages of a chat are also kept in memory
+  for context, until OpenBot quits. Disconnect makes the bot leave the chat, unlinks it and keeps
+  the conversations; deleting an agent removes its conversations.
+- **Read from Telegram.** The messages that mention the bot, replies to it and the other messages of a
+  reply chain that Telegram sends, the messages of a direct chat, the message that a request
+  answers, the files in them, the names of their authors and the name of the chat. With privacy
+  mode on, which is Telegram's default for a bot, Telegram sends a bot only messages that mention it,
+  replies to it and commands.
+- **Given to the Telegram Orchestrator.** Every new Telegram request goes first to the orchestrator
+  agent, which runs on its provider like any other agent and passes the work to a teammate with the
+  facts it needs.
+- **Sent to Telegram.** The agents' answers and the files they attach, short status posts ("Working on
+  it…"), reactions, and approval requests with the command, folder and reason the provider gave,
+  redacted. A failed request posts a fixed sentence, never the provider's error.
+
+Anyone who can post in a linked chat can give the agents work. The agents run on the host with the
+access the user gave them. A hosted server stays awake while a Telegram connection is live.
 
 Plugin pages on openbot.run show each listing's own icon. The page asks `openbot.run` for that
 picture, and the website fetches it there from the address the plugin catalog holds, so reading a
