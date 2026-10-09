@@ -27,6 +27,49 @@ export interface PickerModelGroup {
   models: PickerModel[];
 }
 
+/**
+ * How a provider id inside a custom agent reads in a group heading. A known tool keeps its brand
+ * casing; any other id falls back to one capitalized word per `-`, `_` or space.
+ */
+const KNOWN_PROVIDER_LABELS: Record<string, string> = {
+  anthropic: "Anthropic",
+  chatgpt: "ChatGPT",
+  claude: "Claude",
+  cline: "Cline",
+  commandcode: "CommandCode",
+  copilot: "Copilot",
+  cursor: "Cursor",
+  deepseek: "DeepSeek",
+  devin: "Devin",
+  gemini: "Gemini",
+  github: "GitHub",
+  google: "Google",
+  grok: "Grok",
+  kimi: "Kimi",
+  minimax: "MiniMax",
+  ollama: "Ollama",
+  openai: "OpenAI",
+  opencode: "OpenCode",
+  openrouter: "OpenRouter",
+  qwen: "Qwen",
+};
+
+function providerLabel(id: string): string {
+  return (
+    KNOWN_PROVIDER_LABELS[id.toLowerCase()] ??
+    id
+      .replace(/[-_\s]+(.)?/g, (_match, letter: string) => (letter ? ` ${letter.toUpperCase()}` : ""))
+      .replace(/^./, (letter) => letter.toUpperCase())
+  );
+}
+
+/** `Agent/provider` group keys read `Agent · Provider`; a bare service stays as the agent named it. */
+function groupLabel(service: string): string {
+  const separator = service.lastIndexOf("/");
+  if (separator < 0) return service;
+  return `${service.slice(0, separator)} · ${providerLabel(service.slice(separator + 1))}`;
+}
+
 /** Free tier first; id says nothing about locality. */
 function modelTier(model: PickerModel): 0 | 1 {
   return model.free ? 0 : 1;
@@ -69,12 +112,25 @@ export function pickerModels(options: AgentModelOption[]): PickerModel[] {
       }
       // OpenCode and custom agent models are named `<service>/<model>`; the service is the group.
       const separator = model.provider === "opencode" || model.provider === "acp" ? model.name.indexOf("/") : -1;
-      const name = (separator < 0 ? model.name : model.name.slice(separator + 1)).replace(/^[\s:–—-]+/, "") || model.id;
+      let service = separator < 0 ? "" : model.name.slice(0, separator);
+      let name = separator < 0 ? model.name : model.name.slice(separator + 1);
+      // A custom agent can serve several providers. Its id holds them as `<agent>/<provider>/<model>`
+      // even when its display name does not, so the provider segment of the id is the group.
+      if (model.provider === "acp") {
+        const idSeparator = model.id.indexOf("/");
+        const innerId = idSeparator < 0 ? "" : model.id.slice(idSeparator + 1);
+        const providerEnd = innerId.indexOf("/");
+        const provider = providerEnd < 0 ? "" : innerId.slice(0, providerEnd);
+        if (provider) service = `${service}/${provider}`;
+        const inner = name.indexOf("/");
+        if (inner >= 0 && (!provider || name.slice(0, inner) === provider)) name = name.slice(inner + 1);
+      }
+      name = name.replace(/^[\s:–—-]+/, "") || model.id;
       return {
         id: model.id,
         provider: model.provider,
         name,
-        service: separator < 0 ? "" : model.name.slice(0, separator),
+        service,
         // Free-tier label only; shared with catalog order so badge and default agree.
         free: model.provider === "opencode" && isFreeOpencodeModel(model.id, name),
         variants: variants.has(model.id)
@@ -91,7 +147,8 @@ export function groupPickerModels(models: PickerModel[], search: string): Picker
   const tiers = new Map<string, number>();
   for (const model of models) {
     if (!`${model.service} ${model.name}`.toLowerCase().includes(query)) continue;
-    const group = groups.get(model.service) ?? { name: model.service, models: [] };
+    const name = model.provider === "acp" ? groupLabel(model.service) : model.service;
+    const group = groups.get(model.service) ?? { name, models: [] };
     group.models.push(model);
     groups.set(model.service, group);
     tiers.set(model.service, Math.min(tiers.get(model.service) ?? modelTier(model), modelTier(model)));
