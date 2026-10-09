@@ -44,6 +44,7 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   devin: "Devin",
   gemini: "Gemini",
   github: "GitHub",
+  "github-copilot": "GitHub Copilot",
   openai: "OpenAI",
   openrouter: "OpenRouter",
 };
@@ -149,7 +150,10 @@ export function groupPickerModels(models: PickerModel[], search: string): Picker
     tiers.set(model.service, Math.min(tiers.get(model.service) ?? modelTier(model), modelTier(model)));
   }
   for (const group of groups.values()) group.models.sort((left, right) => modelTier(left) - modelTier(right));
-  return [...groups.values()].sort((left, right) => (tiers.get(left.name) ?? 0) - (tiers.get(right.name) ?? 0));
+  // Tiers are keyed by service: an ACP group name is a label that differs from its key.
+  return [...groups.entries()]
+    .sort(([left], [right]) => (tiers.get(left) ?? 0) - (tiers.get(right) ?? 0))
+    .map(([, group]) => group);
 }
 
 export function customProviderIds(providers: readonly CustomProviderSummary[]): ReadonlySet<string> {
