@@ -1,5 +1,11 @@
 import type { AgentModelOption, AgentProviderId, CustomProviderSummary } from "@openbot/contracts/ipc";
-import { CUSTOM_AGENT_DEFAULT_MODEL, isCustomProviderModelId, isFreeOpencodeModel } from "@openbot/contracts/ipc";
+import {
+  agentProviderName,
+  CUSTOM_AGENT_DEFAULT_MODEL,
+  isAgentProvider,
+  isCustomProviderModelId,
+  isFreeOpencodeModel,
+} from "@openbot/contracts/ipc";
 import type { AppTextKey } from "@openbot/i18n";
 import { currentText } from "../text";
 
@@ -28,39 +34,28 @@ export interface PickerModelGroup {
 }
 
 /**
- * How a provider id inside a custom agent reads in a group heading. A known tool keeps its brand
- * casing; any other id falls back to one capitalized word per `-`, `_` or space.
+ * How a provider id inside a custom agent reads in a group heading. An id that is also an OpenBot
+ * provider takes its display name; a few other well-known ids keep their brand casing here; any
+ * other id falls back to one capitalized word per `-`, `_` or space.
  */
 const KNOWN_PROVIDER_LABELS: Record<string, string> = {
-  anthropic: "Anthropic",
   chatgpt: "ChatGPT",
-  claude: "Claude",
-  cline: "Cline",
-  commandcode: "CommandCode",
-  copilot: "Copilot",
-  cursor: "Cursor",
   deepseek: "DeepSeek",
   devin: "Devin",
   gemini: "Gemini",
   github: "GitHub",
-  google: "Google",
-  grok: "Grok",
-  kimi: "Kimi",
-  minimax: "MiniMax",
-  ollama: "Ollama",
   openai: "OpenAI",
-  opencode: "OpenCode",
   openrouter: "OpenRouter",
-  qwen: "Qwen",
 };
 
 function providerLabel(id: string): string {
-  return (
-    KNOWN_PROVIDER_LABELS[id.toLowerCase()] ??
-    id
-      .replace(/[-_\s]+(.)?/g, (_match, letter: string) => (letter ? ` ${letter.toUpperCase()}` : ""))
-      .replace(/^./, (letter) => letter.toUpperCase())
-  );
+  const lower = id.toLowerCase();
+  const known = KNOWN_PROVIDER_LABELS[lower];
+  if (known) return known;
+  if (isAgentProvider(lower)) return agentProviderName(lower);
+  return id
+    .replace(/[-_\s]+(.)?/g, (_match, letter: string) => (letter ? ` ${letter.toUpperCase()}` : ""))
+    .replace(/^./, (letter) => letter.toUpperCase());
 }
 
 /** `Agent/provider` group keys read `Agent · Provider`; a bare service stays as the agent named it. */
